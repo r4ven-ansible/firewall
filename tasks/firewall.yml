@@ -1,0 +1,149 @@
+---
+
+- name: Disable other firewall
+  tags: [firewall, nft_other_firewall]
+  when: nft_remove_other_firewall | bool
+  block:
+    - name: Disable other firewall
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        daemon_reload: true
+      failed_when: false
+      loop:
+        - firewalld
+        - ufw
+        - iptables
+        - netfilter-persistent
+
+    - name: Ensure other firewall is uninstalled
+      ansible.builtin.apt:
+        name:
+          - "firewalld"
+          - "ufw"
+        state: absent
+      retries: 3
+
+- name: Ensure nftables is installed
+  ansible.builtin.apt:
+    name: "{{ nft_packages }}"
+    state: present
+    update_cache: "{{ nft_apt_update_cache }}"
+    cache_valid_time: "{{ nft_apt_update_cache | bool | ternary(nft_apt_cache_valid_time, omit) }}"
+  retries: 3
+  when: not ansible_check_mode
+  tags: [firewall, nft_packages]
+
+
+- name: Prepare nftables ruleset
+  tags: [firewall, nft_rules, nft_config, nft_apply]
+  block:
+    - name: Initialize allowed port rules
+      ansible.builtin.set_fact:
+        nft_allowed_port_rules: {}
+        nft_allowed_tcp_ports: []
+        nft_allowed_udp_ports: []
+
+    - name: Collect allowed TCP ports
+      ansible.builtin.set_fact:
+        nft_allowed_tcp_ports: "{{ nft_allowed_tcp_ports + [(item | string).split('/')[0]] }}"
+      loop: "{{ nft_allowed_ports }}"
+      when:
+        - nft_allowed_ports | length > 0
+        - (item | string).split('/') | length == 1 or (item | string).split('/')[1] == 'tcp'
+        - >
+          not nft_allowed_ports_exclude_ssh | bool
+          or ((item | string).split('/')[0])
+          != (ssh_port | default('22') | string)
+
+    - name: Collect allowed UDP ports
+      ansible.builtin.set_fact:
+        nft_allowed_udp_ports: "{{ nft_allowed_udp_ports + [(item | string).split('/')[0]] }}"
+      loop: "{{ nft_allowed_ports }}"
+      when:
+        - nft_allowed_ports | length > 0
+        - (item | string).split('/') | length > 1
+        - (item | string).split('/')[1] == 'udp'
+
+    - name: Build grouped allowed port rules
+      ansible.builtin.set_fact:
+        nft_allowed_port_rules: >-
+          {{
+            {}
+            | combine(
+              (nft_allowed_tcp_ports | length > 0)
+              | ternary({
+                'wan_allow_tcp_ports': {
+                  'order': 111,
+                  'family': 'inet',
+                  'table': 'filter',
+                  'chain': 'input_wan',
+                  'match': {
+                    'tcp': {
+                      'dport': nft_allowed_tcp_ports
+                    }
+                  },
+                  'action': 'accept',
+                  'comment': 'Allow TCP ports from WAN'
+                }
+              }, {}),
+              recursive=True
+            )
+            | combine(
+              (nft_allowed_udp_ports | length > 0)
+              | ternary({
+                'wan_allow_udp_ports': {
+                  'order': 112,
+                  'family': 'inet',
+                  'table': 'filter',
+                  'chain': 'input_wan',
+                  'match': {
+                    'udp': {
+                      'dport': nft_allowed_udp_ports
+                    }
+                  },
+                  'action': 'accept',
+                  'comment': 'Allow UDP ports from WAN'
+                }
+              }, {}),
+              recursive=True
+            )
+          }}
+      when: nft_allowed_ports | length > 0
+
+    - name: Merge nftables rules dictionaries
+      ansible.builtin.set_fact:
+        nft_rules_final: >-
+          {{
+            nft_rules
+            | combine(nft_allowed_port_rules, recursive=True)
+            | combine(nft_rules_extra, recursive=True)
+          }}
+
+    - name: Remove null rules
+      ansible.builtin.set_fact:
+        nft_rules_final: "{{ nft_rules_final | dict2items | rejectattr('value', 'none') | items2dict }}"
+
+
+- name: Apply nftables transaction
+  ansible.builtin.import_tasks: apply.yml
+  tags: [firewall, nft_config, nft_apply]
+
+- name: Enable nftables
+  ansible.builtin.systemd_service:
+    name: nftables
+    enabled: true
+    masked: false
+  when: "not ansible_check_mode or (nft_binary | default({'stat': {'exists': false}})).stat.exists"
+  tags: [firewall, nft_systemd, nft_apply]
+
+- name: Restart docker
+  ansible.builtin.systemd_service:
+    name: docker
+    state: restarted
+  failed_when: false
+  when:
+    - nft_restart_docker | bool
+    - nft_config_copied.changed | default(false)
+  tags: [firewall, nft_docker]

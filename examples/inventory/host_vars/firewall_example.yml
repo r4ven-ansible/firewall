@@ -1,0 +1,13 @@
+---
+# Replace the documentation address/user in hosts.yml before connecting.
+# Enable only after reviewing the base policy and management access.
+firewall_enabled: false
+ssh_port: "{{ ansible_port }}"
+nft_allowed_ports:
+  - "80/tcp"
+  - "443/tcp"
+  - "443/udp"
+
+# For a private WAN, review the spoof guards and LAN/WAN classification.
+# See README.md before disabling protection or enabling this host.
+nft_rules_extra: {}

@@ -1,0 +1,783 @@
+---
+
+firewall_enabled: false
+nft_remove_other_firewall: false
+nft_flush_ruleset: false
+nft_restart_docker: false
+
+nft_bin: "/usr/sbin/nft"
+nft_config_path: "/etc/nftables.conf"
+nft_backup_path: "/root/nft_backup"
+nft_validate_cmd: "{{ nft_bin }} -c -f %s"
+nft_wan_interface: "{{ ansible_default_ipv4.interface | default('unknown0', true) }}"
+
+# TABLES
+nft_tables:
+  - family: inet
+    name: filter
+  - family: inet
+    name: nat
+
+
+# SETS
+nft_sets:
+  - family: inet
+    table: filter
+    name: lan4
+    type: ipv4_addr
+    flags: interval
+    elements: "{{ nft_lan4_networks }}"
+
+  - family: inet
+    table: filter
+    name: lan6
+    type: ipv6_addr
+    flags: interval
+    elements: "{{ nft_lan6_networks }}"
+
+  - family: inet
+    table: filter
+    name: trusted
+    type: ipv4_addr
+    flags: interval
+    elements: "{{ nft_trusted_ips }}"
+
+  # per-source SSH rate limiting
+  - family: inet
+    table: filter
+    name: ssh_flood4
+    type: ipv4_addr
+    flags: dynamic
+    size: 65536
+    timeout: 10m
+
+  - family: inet
+    table: filter
+    name: ssh_flood6
+    type: ipv6_addr
+    flags: dynamic
+    size: 65536
+    timeout: 10m
+
+
+# SET CONTENT
+nft_lan4_networks:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  - 169.254.0.0/16
+
+nft_lan6_networks:
+  - fd00::/8
+  - fe80::/10
+
+nft_trusted_ips:
+  - 203.0.113.10
+
+
+# CHAINS
+# https://wiki.nftables.org/wiki-nftables/index.php/Netfilter_hooks
+nft_chains:
+
+  - family: inet
+    table: filter
+    name: input
+    type: filter
+    hook: input
+    priority: -1
+    policy: drop
+
+  - family: inet
+    table: filter
+    name: forward
+    type: filter
+    hook: forward
+    priority: -51
+    policy: accept
+
+  # priority must stay above -200 (conntrack), otherwise ct matches
+  # in this chain will never work
+  - family: inet
+    table: filter
+    name: output
+    type: filter
+    hook: output
+    priority: -1
+    policy: accept
+
+  - family: inet
+    table: nat
+    name: prerouting
+    type: nat
+    hook: prerouting
+    priority: -101
+    policy: accept
+
+  - family: inet
+    table: nat
+    name: output
+    type: nat
+    hook: output
+    priority: -101
+    policy: accept
+
+  - family: inet
+    table: nat
+    name: postrouting
+    type: nat
+    hook: postrouting
+    priority: 99
+    policy: accept
+
+  # custom chains
+  - family: inet
+    table: filter
+    name: input_wan
+
+  - family: inet
+    table: filter
+    name: input_lan
+
+  - family: inet
+    table: filter
+    name: log_drop
+
+
+# RULES
+nft_rules:
+
+  # ---- BASE ----
+  drop_invalid:
+    order: 10
+    family: inet
+    table: filter
+    chain: input
+    match:
+      ct:
+        state: invalid
+    action: drop
+    comment: "Drop invalid connections"
+
+  # ---- WAN SPOOFING GUARD ----
+  # must run before allow_established so spoofed packets cannot
+  # piggyback on existing conntrack entries
+  drop_wan_spoofed_lan_ipv4:
+    order: 12
+    family: inet
+    table: filter
+    chain: input
+    expr: 'iifname "{{ nft_wan_interface }}" ip saddr @lan4'
+    action:
+      jump: log_drop
+    comment: "Drop spoofed private IPv4 from WAN"
+
+  drop_wan_spoofed_lan_ipv6:
+    order: 13
+    family: inet
+    table: filter
+    chain: input
+    expr: 'iifname "{{ nft_wan_interface }}" ip6 saddr @lan6'
+    action:
+      jump: log_drop
+    comment: "Drop spoofed private IPv6 from WAN"
+
+  allow_established:
+    order: 20
+    family: inet
+    table: filter
+    chain: input
+    match:
+      ct:
+        state: [established, related]
+    action: accept
+    comment: "Allow established connections"
+
+  allow_loopback:
+    order: 30
+    family: inet
+    table: filter
+    chain: input
+    match:
+      iif: lo
+    action: accept
+    comment: "Allow loopback"
+
+  allow_trusted:
+    order: 40
+    family: inet
+    table: filter
+    chain: input
+    match:
+      ip:
+        saddr:
+          value: "@trusted"
+    action: accept
+    comment: "Allow trusted IPs"
+
+  icmp4:
+    order: 50
+    family: inet
+    table: filter
+    chain: input
+    match:
+      meta:
+        l4proto: icmp
+      icmp:
+        type: [echo-request, destination-unreachable, time-exceeded]
+      limit:
+        rate: "10/second"
+    action: accept
+    comment: "ICMP rate limited"
+
+  icmp6:
+    order: 60
+    family: inet
+    table: filter
+    chain: input
+    match:
+      meta:
+        l4proto: ipv6-icmp
+      icmpv6:
+        type:
+          - destination-unreachable
+          - packet-too-big
+          - time-exceeded
+          - parameter-problem
+          - nd-router-solicit
+          - nd-router-advert
+          - nd-neighbor-solicit
+          - nd-neighbor-advert
+    action: accept
+    comment: "Necessary IPv6 ICMP"
+
+  icmp6_ping:
+    order: 61
+    family: inet
+    table: filter
+    chain: input
+    match:
+      meta:
+        l4proto: ipv6-icmp
+      icmpv6:
+        type: echo-request
+      limit:
+        rate: "10/second"
+    action: accept
+    comment: "ICMPv6 ping rate limited"
+
+  # ---- LAN/WAN SPLIT ----
+  jump_to_lan_ipv4:
+    order: 80
+    family: inet
+    table: filter
+    chain: input
+    match:
+      ip:
+        saddr:
+          value: "@lan4"
+    action:
+      jump: input_lan
+
+  jump_to_lan_ipv6:
+    order: 81
+    family: inet
+    table: filter
+    chain: input
+    match:
+      ip6:
+        saddr:
+          value: "@lan6"
+    action:
+      jump: input_lan
+
+  jump_to_wan_ipv4:
+    order: 82
+    family: inet
+    table: filter
+    chain: input
+    match:
+      ip:
+        saddr:
+          op: "!="
+          value: "@lan4"
+    action:
+      jump: input_wan
+
+  jump_to_wan_ipv6:
+    order: 83
+    family: inet
+    table: filter
+    chain: input
+    match:
+      ip6:
+        saddr:
+          op: "!="
+          value: "@lan6"
+    action:
+      jump: input_wan
+
+  default_drop:
+    order: 90
+    family: inet
+    table: filter
+    chain: input
+    action:
+      jump: log_drop
+
+  # ---- LAN ----
+  input_lan_allow_all:
+    order: 100
+    family: inet
+    table: filter
+    chain: input_lan
+    action: accept
+    comment: "Allow all from LAN"
+
+  # ---- WAN ----
+  # per-source limit: a single flooding source cannot exhaust
+  # the SSH budget for everyone else
+  wan_ssh_flood_ipv4:
+    order: 108
+    family: inet
+    table: filter
+    chain: input_wan
+    match:
+      meta:
+        l4proto: tcp
+      tcp:
+        dport: "{{ ssh_port | default('22') }}"
+      ct:
+        state: new
+      raw: 'add @ssh_flood4 { ip saddr limit rate over 20/minute }'
+    action:
+      jump: log_drop
+    comment: "Drop SSH flood per IPv4 source"
+
+  wan_ssh_flood_ipv6:
+    order: 109
+    family: inet
+    table: filter
+    chain: input_wan
+    match:
+      meta:
+        l4proto: tcp
+      tcp:
+        dport: "{{ ssh_port | default('22') }}"
+      ct:
+        state: new
+      raw: 'add @ssh_flood6 { ip6 saddr limit rate over 20/minute }'
+    action:
+      jump: log_drop
+    comment: "Drop SSH flood per IPv6 source"
+
+  wan_allow_ssh:
+    order: 110
+    family: inet
+    table: filter
+    chain: input_wan
+    match:
+      meta:
+        l4proto: tcp
+      tcp:
+        dport: "{{ ssh_port | default('22') }}"
+      ct:
+        state: new
+    action: accept
+    comment: "SSH rate limited per source"
+
+  # wan_allow_http_https:
+  #   order: 111
+  #   family: inet
+  #   table: filter
+  #   chain: input_wan
+  #   match:
+  #     tcp:
+  #       dport: [80, 443]
+  #   action: accept
+
+  # wan_allow_dns_ntp:
+  #   order: 112
+  #   family: inet
+  #   table: filter
+  #   chain: input_wan
+  #   match:
+  #     udp:
+  #       dport: [53, 123]
+  #   action: accept
+
+  wan_default_drop:
+    order: 198
+    family: inet
+    table: filter
+    chain: input_wan
+    action:
+      jump: log_drop
+    comment: "Default WAN drop"
+
+  # wan_drop_new:
+  #   order: 199
+  #   family: inet
+  #   table: filter
+  #   chain: input_wan
+  #   match:
+  #     ct:
+  #       state: new
+  #   action:
+  #     jump: log_drop
+
+  # ---- FORWARD ----
+  fwd_drop_invalid:
+    order: 200
+    family: inet
+    table: filter
+    chain: forward
+    match:
+      ct:
+        state: invalid
+    action: drop
+    comment: "Drop invalid forwarded connections"
+
+  # spoofing guard must run before fwd_allow_established
+  fwd_drop_wan_spoofed_lan_ipv4:
+    order: 201
+    family: inet
+    table: filter
+    chain: forward
+    expr: 'iifname "{{ nft_wan_interface }}" ip saddr @lan4'
+    action:
+      jump: log_drop
+    comment: "Drop spoofed private IPv4 forwarded from WAN"
+
+  fwd_drop_wan_spoofed_lan_ipv6:
+    order: 202
+    family: inet
+    table: filter
+    chain: forward
+    expr: 'iifname "{{ nft_wan_interface }}" ip6 saddr @lan6'
+    action:
+      jump: log_drop
+    comment: "Drop spoofed private IPv6 forwarded from WAN"
+
+  fwd_allow_established:
+    order: 205
+    family: inet
+    table: filter
+    chain: forward
+    match:
+      ct:
+        state: [established, related]
+    action: accept
+    comment: "Allow established forwarded connections"
+
+  # # Vritual interfaces
+
+  # # fwd_docker:
+  # #   order: 220
+  # #   family: inet
+  # #   table: filter
+  # #   chain: forward
+  # #   match:
+  # #     iifname: "br-*"
+  # #     oifname: "br-*"
+  # #   action: accept
+
+  # fwd_eth_iif:
+  #   order: 220
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "eth*"
+  #   action: accept
+
+  # fwd_eth_oif:
+  #   order: 221
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "eth*"
+  #   action: accept
+
+  # fwd_enp_iif:
+  #   order: 220
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "enp*"
+  #   action: accept
+
+  # fwd_enp_oif:
+  #   order: 221
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "enp*"
+  #   action: accept
+
+  # fwd_ens_iif:
+  #   order: 222
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "ens*"
+  #   action: accept
+
+  # fwd_ens_oif:
+  #   order: 223
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "ens*"
+  #   action: accept
+
+  # fwd_docker_iif:
+  #   order: 224
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "br-*"
+  #   action: accept
+
+  # fwd_docker_oif:
+  #   order: 225
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     oifname: "br-*"
+  #   action: accept
+
+  # fwd_cni_iif:
+  #   order: 226
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "cni*"
+  #   action: accept
+
+  # fwd_cni_oif:
+  #   order: 227
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     oifname: "cni*"
+  #   action: accept
+
+  # fwd_flannel_iif:
+  #   order: 228
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "flannel*"
+  #   action: accept
+
+  # fwd_flannel_oif:
+  #   order: 229
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     oifname: "flannel*"
+  #   action: accept
+
+  # fwd_calico_iif:
+  #   order: 231
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "vxlan.calico*"
+  #   action: accept
+
+  # fwd_calico_oif:
+  #   order: 232
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     oifname: "vxlan.calico*"
+  #   action: accept
+
+  # fwd_libvirt_iif:
+  #   order: 233
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "virbr*"
+  #   action: accept
+
+  # fwd_libvirt_oif:
+  #   order: 234
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     oifname: "virbr*"
+  #   action: accept
+
+  # fwd_pve_iif:
+  #   order: 235
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "vmbr*"
+  #   action: accept
+
+  # fwd_pve_oif:
+  #   order: 236
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     oifname: "vmbr*"
+  #   action: accept
+
+  # fwd_tun_iif:
+  #   order: 237
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "tun*"
+  #   action: accept
+
+  # fwd_tun_oif:
+  #   order: 238
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     oifname: "tun*"
+  #   action: accept
+
+  # fwd_wg_iif:
+  #   order: 239
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "wg*"
+  #   action: accept
+
+  # fwd_wg_oif:
+  #   order: 240
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     oifname: "wg*"
+  #   action: accept
+
+  # fwd_vpns_iif:
+  #   order: 241
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     iifname: "vpns*"
+  #   action: accept
+
+  # fwd_vpns_oif:
+  #   order: 242
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     oifname: "vpns*"
+  #   action: accept
+
+  # fwd_default_drop:
+  #   order: 299
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     ct:
+  #       state: new
+  #   action:
+  #     jump: log_drop
+
+  # ---- LOG/DROP ----
+  logdrop_log:
+    order: 300
+    family: inet
+    table: filter
+    chain: log_drop
+    match:
+      limit:
+        rate: "5/second"
+    action:
+      log:
+        prefix: "NFT-DROP: "
+        flags: all
+
+  logdrop_drop:
+    order: 301
+    family: inet
+    table: filter
+    chain: log_drop
+    action: drop
+
+  # ????
+  # fwd_private_ipv4:
+  #   order: 230
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     ip:
+  #       saddr:
+  #         value: "@lan4"
+  #       daddr:
+  #         value: "@lan4"
+  #   action: accept
+  #   comment: "Allow IPv4 forwarding between private IPs"
+
+  # fwd_private_ipv6:
+  #   order: 231
+  #   family: inet
+  #   table: filter
+  #   chain: forward
+  #   match:
+  #     ip6:
+  #       saddr:
+  #         value: "@lan6"
+  #       daddr:
+  #         value: "@lan6"
+  #   action: accept
+  #   comment: "Allow IPv6 forwarding between private IPs"
+
+
+  # ---- NAT ----
+  # nat_redirect_443:
+  #   order: 400
+  #   family: inet
+  #   table: nat
+  #   chain: prerouting
+  #   match:
+  #     iifname: eth0
+  #     tcp:
+  #       dport: 443
+  #   action:
+  #     redirect:
+  #       to: 43443
+
+  # nat_masquerade_tun:
+  #   order: 410
+  #   family: inet
+  #   table: nat
+  #   chain: postrouting
+  #   match:
+  #     oifname: "tun*"
+  #   action: masquerade

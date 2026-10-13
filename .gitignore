@@ -1,0 +1,11 @@
+.venv/
+.ansible/
+__pycache__/
+*.py[cod]
+*.retry
+.pytest_cache/
+.cache/
+dist/
+.env
+.pass
+.vault-pass*

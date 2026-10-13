@@ -1,0 +1,169 @@
+---
+
+firewall_supported_distributions:
+  - Debian
+  - LMDE
+
+firewall_enabled: false
+
+nft_remove_other_firewall: false
+nft_flush_ruleset: false
+nft_restart_docker: false
+nft_packages:
+  - nftables
+nft_apt_update_cache: true
+nft_apt_cache_valid_time: 3600
+nft_bin: /usr/sbin/nft
+nft_config_path: /etc/nftables.conf
+nft_backup_path: /root/nft_backup
+nft_backup_keep: 10
+nft_validate_cmd: "{{ nft_bin }} -c -f %s"
+nft_wan_interface: >-
+  {{ ansible_default_ipv4.interface
+     | default(ansible_default_ipv6.interface | default('unknown0', true), true) }}
+
+# Rollback safety net: a transient systemd timer restores the previous
+# runtime ruleset, config (including absence), and service enablement/mask
+# unless a locked commit wins before rollback. Armed only with the SSH check.
+nft_rollback_unit: nft-rollback
+nft_rollback_timeout: 120
+
+# The check connects to the target's SSH port from nft_ssh_check_delegate.
+# With ProxyJump/bastion setups the control node may have no direct
+# access: point nft_ssh_check_delegate at the bastion (it needs direct
+# reachability to the target) or set nft_ssh_check_enabled: false.
+nft_ssh_check_enabled: true
+nft_ssh_check_delegate: localhost
+nft_ssh_check_host: "{{ ansible_host | default(inventory_hostname) }}"
+nft_ssh_check_port: "{{ ssh_port | default(22) }}"
+nft_ssh_check_timeout: 30
+
+nft_tables: []
+nft_sets: []
+nft_maps: []
+nft_flowtables: []
+nft_chains: []
+nft_rules: {}
+nft_allowed_ports: []
+nft_allowed_ports_exclude_ssh: true
+nft_rules_extra: {}
+
+# =========================
+# How to change/add rules
+# =========================
+
+# nft_rules_extra:
+
+#   # Add new rule
+#   allow_prometheus:
+#     order: 115
+#     family: inet
+#     table: filter
+#     chain: input_wan
+#     match:
+#       tcp:
+#         dport: 9100
+#     action: accept
+
+#   # Delete rule
+#   wan_allow_ssh: null
+
+#   # Change exits rule
+#   wan_allow_ssh:
+#     match:
+#       tcp:
+#         dport: 2222
+
+#   # Change only action
+#   wan_allow_http_https:
+#     action: drop
+
+
+# =========================
+# nftables DSL (cheat sheet)
+# =========================
+
+# match → фильтр пакета
+# action → что с ним делать
+# order → когда применять
+
+# rule:
+#   order: int              # порядок выполнения
+#   family: inet|ip|ip6     # семейство
+#   table: filter|nat       # таблица
+#   chain: input|forward|output|custom
+
+#   match:                  # УСЛОВИЯ (фильтрация пакета)
+#     ct:                   # connection tracking
+#       state: [new, established, related, invalid]
+#       status: dnat
+
+#     meta:
+#       l4proto: tcp|udp|icmp
+#       mark: int
+
+#     ip:                   # IPv4
+#       saddr: { value: "@set", op: "!=" }   # @set / IP / CIDR
+#       daddr: { value: "1.2.3.4", op: "=" }
+
+#     ip6:                  # IPv6
+#       saddr: "@set"
+
+#     tcp:
+#       dport: 22
+#       sport: [1024-65535]
+#       flags: syn                       # tcp flags syn
+#       # для битовых масок используйте raw:
+#       # raw: 'tcp flags & (syn|ack) == syn'
+
+#     udp:
+#       dport: [53, 123]
+
+#     icmp:
+#       type: [echo-request, destination-unreachable]
+
+#     icmpv6:
+#       type: [nd-router-solicit, nd-neighbor-advert]
+
+#     iif: lo              # input interface
+#     iifname: eth0
+#     iifname: { op: "!=", value: "lo" }
+#     oifname: "br-*"
+
+#     limit:
+#       rate: "10/second"
+#       burst: 5
+#
+#     raw:
+#       - 'fib saddr . iif oif missing'
+
+#   action:                # ДЕЙСТВИЕ
+#     accept
+#     drop
+#     reject
+
+#     jump: chain_name
+#     goto: chain_name
+
+#     redirect:
+#       to: 43443
+#     redirect: ":553"
+
+#     dnat: "192.168.1.10:443"    # только если в match есть ip/ip6
+#     dnat:
+#       to: "192.168.1.10:443"    # только если в match есть ip/ip6
+#     dnat:
+#       ip: "192.168.1.10:443"    # dnat ip to ... (для family inet)
+#     dnat:
+#       ip6: "[fd00::1]:443"      # dnat ip6 to ... (для family inet)
+#     snat: "1.2.3.4"             # snat ip/ip6 аналогично dnat
+#     masquerade: true
+
+#     log:
+#       prefix: "DROP: "
+#       flags: all
+#
+#     counter: true
+#     raw: 'counter log prefix "DROP: " drop'
+
+#   comment: "text"        # описание правила

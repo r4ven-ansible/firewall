@@ -1,0 +1,191 @@
+#!{{ nft_bin }} -f
+
+{% macro nft_bool(v) -%}
+{{ 'yes' if v | bool else 'no' }}
+{%- endmacro %}
+
+{% macro nft_val(v) -%}
+{%- if v is iterable and v is not string and v is not mapping -%}
+{ {% for x in v %}{{ x }}{% if not loop.last %}, {% endif %}{% endfor %} }
+{%- else -%}
+{{ v }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro nft_stmt(stmt) -%}
+{%- if stmt is iterable and stmt is not string and stmt is not mapping -%}
+{{ stmt | join(' ') }}
+{%- else -%}
+{{ stmt }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro nft_field(prefix, key, val) -%}
+{%- if val is mapping and val.value is defined -%}
+{{ (prefix ~ ' ') if prefix | length > 0 else '' }}{{ key }}{{ (' ' ~ val.op) if val.op is defined else '' }} {{ nft_val(val.value) }}
+{%- else -%}
+{{ (prefix ~ ' ') if prefix | length > 0 else '' }}{{ key }} {{ nft_val(val) }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro nft_group(prefix, data) -%}
+{%- for key, val in data.items() -%}
+{{ nft_field(prefix, key, val) }}{% if not loop.last %} {% endif %}
+{%- endfor -%}
+{%- endmacro %}
+
+{% macro nft_comment(text) -%}
+comment "{{ text | replace('"', "'") }}"
+{%- endmacro %}
+
+{% macro nft_limit(data) -%}
+limit{% if data.over | default(false) | bool %} over{% endif %} rate {{ data.rate }}{% if data.burst is defined %} burst {{ data.burst }}{% endif %}
+{%- endmacro %}
+
+{% macro nft_log(data) -%}
+log{% if data.prefix is defined %} prefix "{{ data.prefix }}"{% endif %}{% if data.level is defined %} level {{ data.level }}{% endif %}{% if data.flags is defined %} flags {{ nft_val(data.flags) }}{% endif %}{% if data.group is defined %} group {{ data.group }}{% endif %}
+{%- endmacro %}
+
+{% macro nft_action(action) -%}
+{%- if action is string -%}
+{{ action }}
+{%- elif action is iterable and action is not mapping -%}
+{{ action | join(' ') }}
+{%- elif action is mapping -%}
+{%- if action.counter | default(false) | bool -%}counter {% endif -%}
+{%- if action.log is defined -%}{{ nft_log(action.log) }} {% endif -%}
+{%- if action.accept | default(false) | bool -%}accept
+{%- elif action.drop | default(false) | bool -%}drop
+{%- elif action.return | default(false) | bool -%}return
+{%- elif action.continue | default(false) | bool -%}continue
+{%- elif action.notrack | default(false) | bool -%}notrack
+{%- elif action.jump is defined -%}jump {{ action.jump }}
+{%- elif action.goto is defined -%}goto {{ action.goto }}
+{%- elif action.redirect is defined -%}redirect{% if action.redirect is mapping and action.redirect.to is defined %} to {{ action.redirect.to }}{% elif action.redirect is string or action.redirect is number %} to {{ action.redirect }}{% endif %}{% if action.redirect is mapping and action.redirect.flags is defined %} {{ nft_val(action.redirect.flags) }}{% endif %}
+{%- elif action.dnat is defined -%}dnat{% if action.dnat is mapping and action.dnat.ip is defined %} ip to {{ action.dnat.ip }}{% elif action.dnat is mapping and action.dnat.ip6 is defined %} ip6 to {{ action.dnat.ip6 }}{% elif action.dnat is mapping and action.dnat.to is defined %} to {{ action.dnat.to }}{% else %} to {{ action.dnat }}{% endif %}
+{%- elif action.snat is defined -%}snat{% if action.snat is mapping and action.snat.ip is defined %} ip to {{ action.snat.ip }}{% elif action.snat is mapping and action.snat.ip6 is defined %} ip6 to {{ action.snat.ip6 }}{% elif action.snat is mapping and action.snat.to is defined %} to {{ action.snat.to }}{% else %} to {{ action.snat }}{% endif %}
+{%- elif action.masquerade is defined -%}masquerade{% if action.masquerade is mapping and action.masquerade.flags is defined %} {{ nft_val(action.masquerade.flags) }}{% endif %}
+{%- elif action.reject is defined -%}reject{% if action.reject is mapping and action.reject.with is defined %} with {{ action.reject.with }}{% endif %}
+{%- elif action.queue is defined -%}queue{% if action.queue.num is defined %} num {{ action.queue.num }}{% endif %}{% if action.queue.flags is defined %} flags {{ nft_val(action.queue.flags) }}{% endif %}
+{%- elif action.tproxy is defined -%}tproxy{% if action.tproxy.to is defined %} to {{ action.tproxy.to }}{% endif %}
+{%- elif action.flow is defined -%}flow add @{{ action.flow }}
+{%- elif action.raw is defined -%}{{ nft_stmt(action.raw) }}
+{%- endif -%}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro nft_match(match) -%}
+{%- set ns = namespace(parts=[]) -%}
+{%- for group in ['ct', 'meta', 'ip', 'ip6', 'tcp', 'udp', 'icmp', 'icmpv6', 'ether', 'vlan', 'arp', 'fib', 'socket', 'th'] -%}
+  {%- if match[group] is defined -%}
+    {%- set ns.parts = ns.parts + [nft_group(group, match[group])] -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- for key in ['iif', 'iifname', 'oif', 'oifname'] -%}
+  {%- if match[key] is defined -%}
+    {%- set ns.parts = ns.parts + [nft_field('', key, match[key])] -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if match.mark is defined -%}
+  {%- set ns.parts = ns.parts + [nft_field('meta', 'mark', match.mark)] -%}
+{%- endif -%}
+{%- if match.limit is defined -%}
+  {%- set ns.parts = ns.parts + [nft_limit(match.limit)] -%}
+{%- endif -%}
+{%- if match.raw is defined -%}
+  {%- if match.raw is iterable and match.raw is not string and match.raw is not mapping -%}
+    {%- for raw in match.raw -%}
+      {%- set ns.parts = ns.parts + [raw] -%}
+    {%- endfor -%}
+  {%- else -%}
+    {%- set ns.parts = ns.parts + [match.raw] -%}
+  {%- endif -%}
+{%- endif -%}
+{{ ns.parts | join(' ') }}
+{%- endmacro %}
+
+{% if nft_flush_ruleset | default(false) %}
+flush ruleset
+{% else %}
+{% for table in nft_tables %}
+add table {{ table.family }} {{ table.name }}
+delete table {{ table.family }} {{ table.name }}
+{% endfor %}
+{% endif %}
+
+{% for table in nft_tables %}
+add table {{ table.family }} {{ table.name }}{{ (' ' ~ nft_comment(table.comment)) if table.comment is defined else '' }}
+{% endfor %}
+
+{% for set in nft_sets %}
+add set {{ set.family }} {{ set.table }} {{ set.name }} {
+  {% if set.type is defined %}type {{ set.type }};{% endif %}
+  {% if set.typeof is defined %}typeof {{ set.typeof }};{% endif %}
+  {% if set.flags is defined %}flags {{ nft_val(set.flags) }};{% endif %}
+  {% if set.policy is defined %}policy {{ set.policy }};{% endif %}
+  {% if set.size is defined %}size {{ set.size }};{% endif %}
+  {% if set.timeout is defined %}timeout {{ set.timeout }};{% endif %}
+  {% if set.gc_interval is defined %}gc-interval {{ set.gc_interval }};{% endif %}
+  {% if set.auto_merge | default(false) | bool %}auto-merge;{% endif %}
+  {% if set.comment is defined %}{{ nft_comment(set.comment) }};{% endif %}
+  {% if set.elements | default([]) | length > 0 -%}
+  elements = { {% for elem in set.elements %}{{ elem }}{% if not loop.last %}, {% endif %}{% endfor %} };
+  {% endif -%}
+}
+{% endfor %}
+
+{% for map in nft_maps | default([]) %}
+add map {{ map.family }} {{ map.table }} {{ map.name }} {
+  {% if map.type is defined %}type {{ map.type }};{% endif %}
+  {% if map.typeof is defined %}typeof {{ map.typeof }};{% endif %}
+  {% if map.flags is defined %}flags {{ nft_val(map.flags) }};{% endif %}
+  {% if map.elements | default([]) | length > 0 -%}
+  elements = { {% for elem in map.elements %}{{ elem }}{% if not loop.last %}, {% endif %}{% endfor %} };
+  {% endif -%}
+}
+{% endfor %}
+
+{% for ft in nft_flowtables | default([]) %}
+add flowtable {{ ft.family }} {{ ft.table }} {{ ft.name }} {
+  hook {{ ft.hook | default('ingress') }} priority {{ ft.priority | default(0) }};
+  devices = { {% for dev in ft.devices %}{{ dev }}{% if not loop.last %}, {% endif %}{% endfor %} };
+  {% if ft.counter | default(false) | bool %}counter;{% endif %}
+}
+{% endfor %}
+
+{% for chain in nft_chains %}
+{% if chain.hook is defined %}
+add chain {{ chain.family }} {{ chain.table }} {{ chain.name }} {
+  type {{ chain.type }} hook {{ chain.hook }} priority {{ chain.priority }};
+  {% if chain.policy is defined %}policy {{ chain.policy }};{% endif %}
+  {% if chain.comment is defined %}{{ nft_comment(chain.comment) }};{% endif %}
+}
+{% else %}
+add chain {{ chain.family }} {{ chain.table }} {{ chain.name }}{{ (' { ' ~ nft_comment(chain.comment) ~ '; }') if chain.comment is defined else '' }}
+{% endif %}
+{% endfor %}
+
+{% set rules_sorted = nft_rules_final | dict2items | sort(attribute='value.order') -%}
+{% for item in rules_sorted %}
+{% set r = item.value -%}
+{% set ns = namespace(parts=['add rule', r.family, r.table, r.chain]) -%}
+{% if r.match is defined -%}
+  {% set ns.parts = ns.parts + [nft_match(r.match)] -%}
+{% endif -%}
+{% if r.expr is defined -%}
+  {% set ns.parts = ns.parts + [nft_stmt(r.expr)] -%}
+{% endif -%}
+{% if r.counter | default(false) | bool -%}
+  {% set ns.parts = ns.parts + ['counter'] -%}
+{% endif -%}
+{% if r.log is defined -%}
+  {% set ns.parts = ns.parts + [nft_log(r.log)] -%}
+{% endif -%}
+{% if r.action is defined -%}
+  {% set ns.parts = ns.parts + [nft_action(r.action)] -%}
+{% endif -%}
+{% if r.comment is defined -%}
+  {% set ns.parts = ns.parts + [nft_comment(r.comment)] -%}
+{% endif -%}
+{{ ns.parts | reject('equalto', '') | join(' ') }}
+{% endfor %}

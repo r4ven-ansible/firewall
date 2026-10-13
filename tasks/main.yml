@@ -1,0 +1,16 @@
+---
+
+- name: Validate supported distribution
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution in firewall_supported_distributions
+    fail_msg: >
+      Unsupported distribution: {{ ansible_distribution }}.
+      Supported: {{ firewall_supported_distributions | join(', ') }}.
+    quiet: true
+  tags: [firewall, firewall_checks]
+
+- name: Configure nftables firewall
+  ansible.builtin.import_tasks: firewall.yml
+  when: firewall_enabled | bool
+  tags: [firewall, nftables]
