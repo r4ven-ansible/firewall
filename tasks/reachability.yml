@@ -1,0 +1,17 @@
+---
+
+# Only included when nft_ssh_check_connection is on. Resetting the connection is
+# the only way to make Ansible prove that a *new* connection still works, but it
+# also throws away the established session the immediate rescue rollback depends
+# on: a ruleset that blocks only new connections then waits for the timer instead
+# of being restored at once. That trade-off is worth it when the control node has
+# no direct view of the real management path (ProxyJump, bastion, port
+# forwarding), and not worth it otherwise.
+- name: Drop the persistent control connection
+  ansible.builtin.meta: reset_connection
+
+- name: Check reachability over Ansible's own connection path
+  ansible.builtin.wait_for_connection:
+    connect_timeout: 5
+    sleep: 2
+    timeout: "{{ nft_ssh_check_timeout }}"

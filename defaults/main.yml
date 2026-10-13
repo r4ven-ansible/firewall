@@ -22,21 +22,78 @@ nft_wan_interface: >-
   {{ ansible_facts.get('default_ipv4', {}).get('interface')
      | default(ansible_facts.get('default_ipv6', {}).get('interface') | default('unknown0', true), true) }}
 
-# Rollback safety net: a transient systemd timer restores the previous
-# runtime ruleset, config (including absence), and service enablement/mask
-# unless a locked commit wins before rollback. Armed only with the SSH check.
+# Rollback safety net: a systemd timer restores the previous runtime ruleset,
+# config (including absence), and service enablement/mask unless a locked
+# commit wins before rollback. Independent of the reachability checks below:
+# disabling the checks must never disarm the net.
+nft_rollback_enabled: true
 nft_rollback_unit: nft-rollback
 nft_rollback_timeout: 120
+# systemd coalesces timers (AccuracySec defaults to 1min), which turns the
+# timeout into a suggestion; 1s keeps it close to a deadline.
+nft_rollback_accuracy: 1s
+# Snapshots live outside /tmp so a reboot inside the transaction window cannot
+# lose them, and a persistent on-boot unit restores them if that reboot
+# happens while nftables.service is still masked by the transaction.
+nft_state_dir: /var/lib/nftables-firewall
+nft_rollback_on_boot: true
+nft_rollback_on_boot_delay: 60
 
-# The check connects to the target's SSH port from nft_ssh_check_delegate.
-# With ProxyJump/bastion setups the control node may have no direct
-# access: point nft_ssh_check_delegate at the bastion (it needs direct
-# reachability to the target) or set nft_ssh_check_enabled: false.
+# Reachability after apply. The connection probe reuses Ansible's own path
+# (including ProxyJump/bastion, auth and nonstandard ports) after resetting the
+# persistent connection, so a lost control channel fails fast instead of
+# hanging on a wedged TCP session. The TCP probe is an extra, third-party view
+# from nft_ssh_check_delegate; with a bastion either point the delegate at a
+# host with direct access or set nft_ssh_check_tcp: false.
 nft_ssh_check_enabled: true
+# Off by default: resetting the connection is the only way to prove a *new*
+# Ansible connection works, but it also discards the established session the
+# immediate rescue rollback relies on. Turn it on when the control node cannot
+# see the real management path (ProxyJump, bastion, forwarded port) and accept
+# that recovery then waits for the rollback timer.
+nft_ssh_check_connection: false
+nft_ssh_check_tcp: true
 nft_ssh_check_delegate: localhost
 nft_ssh_check_host: "{{ ansible_host | default(inventory_hostname) }}"
 nft_ssh_check_port: "{{ ssh_port | default(22) }}"
 nft_ssh_check_timeout: 30
+# The role refuses a reachability timeout that outlives the rollback timer,
+# because the timer would then roll back a healthy host mid-check. Only the
+# integration tests, which exercise that race on purpose, turn this off.
+nft_timeout_assert_enabled: true
+
+# Lockout protection. The role reads the live management connection
+# ($SSH_CONNECTION) and keeps it explicitly accepted ahead of every other rule
+# in nft_mgmt_chain, so no rule combination can drop the connection that is
+# applying the rules. Override nft_mgmt_sources to pin the allowed sources
+# (for example a jump host range) instead of autodetecting a single address.
+# The rule is written to nft_config_path like any other, so it also protects the
+# host after a reboot. Two consequences: SSH from that source bypasses the
+# policy's own SSH limits (rate limiting, trusted-only), and a shared or dynamic
+# source (NAT gateway, bastion, CI runner) keeps that bypass for whoever holds
+# the address next, while runs from different control nodes rewrite the rule
+# each time. Pin nft_mgmt_sources to a stable admin range, or disable this and
+# rely on the rollback timer, when either matters more than availability.
+nft_mgmt_allow_enabled: true
+nft_mgmt_sources: []
+nft_mgmt_interface: ""
+# Set false when routing is asymmetric and the inbound interface cannot be
+# derived from the reverse route.
+nft_mgmt_match_interface: true
+nft_mgmt_rule_name: mgmt_allow_current
+nft_mgmt_order: 1
+nft_mgmt_family: inet
+nft_mgmt_table: filter
+nft_mgmt_chain: input
+# sshd's real listening port is known from the live connection; a mismatch with
+# ssh_port means the rendered SSH rules protect a port nobody connects to.
+nft_mgmt_assert_ssh_port: true
+
+# Reapply when the live ruleset no longer matches what the role committed
+# (manual flush, nft -f by hand, stopped service), not only when the rendered
+# config file changes.
+nft_drift_check_enabled: true
+nft_force_apply: false
 
 nft_tables: []
 nft_sets: []
@@ -47,6 +104,10 @@ nft_rules: {}
 nft_allowed_ports: []
 nft_allowed_ports_exclude_ssh: true
 nft_rules_extra: {}
+# Merged after nft_rules_extra, so group vars can keep nft_rules_extra while a
+# host adds or nulls rules without needing the deprecated global
+# hash_behaviour = merge.
+nft_rules_host: {}
 
 # =========================
 # How to change/add rules

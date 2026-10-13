@@ -1,0 +1,236 @@
+---
+
+# Reset per-host state: set_fact persists for the whole play, so a second
+# invocation of the role must not inherit the previous management rule.
+- name: Reset derived firewall facts
+  ansible.builtin.set_fact:
+    nft_mgmt_rules: {}
+    nft_mgmt_iface: ""
+    nft_wan_local4: []
+    nft_wan_local6: []
+
+# Addresses configured on the WAN interface itself, offered as a ready value for
+# the spoof-guard exception sets. Not wired in by default: exempting the whole
+# on-link subnet also hands it whatever the LAN policy grants.
+- name: Collect IPv4 networks configured on the WAN interface
+  ansible.builtin.set_fact:
+    nft_wan_local4: "{{ (nft_wan_local4 + [item.network ~ '/' ~ item.prefix]) | unique }}"
+  loop: >-
+    {{ ([nft_wan_facts.ipv4] if nft_wan_facts.ipv4 is defined else [])
+       + (nft_wan_facts.ipv4_secondaries | default([])) }}
+  loop_control:
+    label: "{{ item.address | default('unknown') }}"
+  vars:
+    nft_wan_facts: "{{ ansible_facts.get(nft_wan_interface | replace('-', '_') | replace('.', '_'), {}) }}"
+  when:
+    - item.network is defined
+    - item.prefix is defined
+
+# Individual addresses, not subnets: facts carry no IPv6 network, and deriving
+# one without ansible.utils is not worth a wrong answer.
+- name: Collect IPv6 addresses configured on the WAN interface
+  ansible.builtin.set_fact:
+    nft_wan_local6: "{{ (nft_wan_local6 + [item.address]) | unique }}"
+  loop: "{{ nft_wan_facts.ipv6 | default([]) }}"
+  loop_control:
+    label: "{{ item.address | default('unknown') }}"
+  vars:
+    nft_wan_facts: "{{ ansible_facts.get(nft_wan_interface | replace('-', '_') | replace('.', '_'), {}) }}"
+  when: item.address is defined
+
+# The management connection is read from the live session, not guessed from
+# inventory: with ProxyJump, NAT or a jump host the source the target actually
+# sees is not ansible_host.
+- name: Read live management connection
+  ansible.builtin.shell: printf '%s\n' "$SSH_CONNECTION"
+  become: false
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  register: nft_mgmt_connection
+
+- name: Parse management connection
+  ansible.builtin.set_fact:
+    nft_mgmt_fields: "{{ (nft_mgmt_connection.stdout | default('') | trim).split() }}"
+
+- name: Note undetectable management connection
+  ansible.builtin.debug:
+    msg: >-
+      SSH_CONNECTION is unavailable ({{ ansible_connection | default('ssh') }}
+      connection, sudo env_reset or a non-interactive wrapper), so the role
+      cannot keep the current management path explicitly accepted. Set
+      nft_mgmt_sources and nft_mgmt_interface manually, or accept that only the
+      rollback timer protects this run.
+  when:
+    - nft_mgmt_allow_enabled | bool
+    - nft_mgmt_fields | length < 4
+    - nft_mgmt_sources | length == 0
+
+- name: Resolve management source, port and interface
+  when:
+    - nft_mgmt_allow_enabled | bool
+    - nft_mgmt_fields | length >= 4 or nft_mgmt_sources | length > 0
+  block:
+    - name: Set management connection facts
+      ansible.builtin.set_fact:
+        nft_mgmt_detected_source: "{{ nft_mgmt_fields[0] | default('') | string }}"
+        nft_mgmt_detected_port: "{{ nft_mgmt_fields[3] | default('') | string }}"
+        nft_mgmt_allow_sources: >-
+          {{ nft_mgmt_sources if nft_mgmt_sources | length > 0
+             else [nft_mgmt_fields[0]] }}
+
+    # The source ends up in a rule that accepts ahead of every policy, so a
+    # wildcard or a malformed value must stop the run, not open the port.
+    - name: Require plain management source addresses
+      ansible.builtin.assert:
+        that:
+          - nft_mgmt_allow_sources | reject('match', nft_mgmt_address_pattern) | list | length == 0
+          - nft_mgmt_allow_sources | select('in', ['0.0.0.0', '0.0.0.0/0', '::', '::/0']) | list | length == 0
+        fail_msg: >-
+          Management sources {{ nft_mgmt_allow_sources | join(', ') }} are not all
+          plain addresses or CIDRs, or include a default route. The management
+          rule accepts ahead of every other rule, so it is never rendered from
+          an unvalidated or wildcard source. Set nft_mgmt_sources explicitly.
+        quiet: true
+      vars:
+        nft_mgmt_address_pattern: '^(\d{1,3}(\.\d{1,3}){3}|[0-9A-Fa-f:]+)(/\d{1,3})?$'
+
+    - name: Require one address family in the management sources
+      ansible.builtin.assert:
+        that:
+          - (nft_mgmt_allow_sources | select('search', ':') | list | length) in
+            [0, nft_mgmt_allow_sources | length]
+        fail_msg: >-
+          nft_mgmt_sources mixes IPv4 and IPv6 ({{ nft_mgmt_allow_sources | join(', ') }}).
+          One rule cannot match both families; keep one family here and add the
+          other through nft_rules_host.
+        quiet: true
+
+    - name: Find the interface carrying the management source
+      ansible.builtin.command:
+        argv: [ip, -o, route, get, "{{ nft_mgmt_allow_sources[0] | ansible.builtin.regex_replace('/.*$', '') }}"]
+      become: false
+      changed_when: false
+      check_mode: false
+      register: nft_mgmt_route
+      when:
+        - nft_mgmt_match_interface | bool
+        - nft_mgmt_interface | length == 0
+
+    - name: Set management interface fact
+      ansible.builtin.set_fact:
+        nft_mgmt_iface: >-
+          {{ nft_mgmt_interface if nft_mgmt_interface | length > 0
+             else (nft_mgmt_route.stdout | default('')
+                   | ansible.builtin.regex_search('\sdev\s+(\S+)', '\1')
+                   | default([], true) | first | default('', true)) }}
+      when: nft_mgmt_match_interface | bool
+
+    - name: Require a resolvable management interface
+      ansible.builtin.assert:
+        that:
+          - nft_mgmt_iface | length > 0
+          - nft_mgmt_iface is match('^[A-Za-z0-9_.:@-]+$')
+        fail_msg: >-
+          Could not determine a usable interface for the management source
+          {{ nft_mgmt_allow_sources | join(', ') }} from "ip route get"
+          (got "{{ nft_mgmt_iface }}"). Set nft_mgmt_interface explicitly, or
+          nft_mgmt_match_interface: false if routing is asymmetric and the rule
+          should not pin an interface.
+        quiet: true
+      when: nft_mgmt_match_interface | bool
+
+    - name: Require the firewall SSH port to match the live sshd listener
+      ansible.builtin.assert:
+        that:
+          - (ssh_port | default(22) | int) == (nft_mgmt_detected_port | int)
+        fail_msg: >-
+          ssh_port is {{ ssh_port | default(22) }}, but this session is served
+          on port {{ nft_mgmt_detected_port }}. The rendered SSH rules would
+          protect a port nobody connects to. Fix ssh_port (and ansible_port),
+          or set nft_mgmt_assert_ssh_port: false if the mismatch is intentional.
+        quiet: true
+      when:
+        - nft_mgmt_assert_ssh_port | bool
+        - nft_mgmt_detected_port | string | length > 0
+        - nft_mgmt_sources | length == 0
+
+    - name: Require the management chain to exist
+      ansible.builtin.assert:
+        that:
+          - nft_chains | selectattr('family', 'equalto', nft_mgmt_family)
+            | selectattr('table', 'equalto', nft_mgmt_table)
+            | selectattr('name', 'equalto', nft_mgmt_chain) | list | length > 0
+        fail_msg: >-
+          nft_mgmt_chain {{ nft_mgmt_family }}/{{ nft_mgmt_table }}/{{ nft_mgmt_chain }}
+          is not declared in nft_chains, so the management allow rule cannot be
+          rendered. Point nft_mgmt_* at an existing chain or disable
+          nft_mgmt_allow_enabled.
+        quiet: true
+
+    # The live session's own port is authoritative: that is the port this
+    # connection is served on, whatever ssh_port says.
+    - name: Render the management allow expression
+      ansible.builtin.set_fact:
+        # Every line stays at the same indentation: a more indented
+        # continuation would keep its newline and split the nft rule.
+        nft_mgmt_expr: >-
+          {{ ('iifname "' ~ nft_mgmt_iface ~ '"') if nft_mgmt_match_interface | bool else '' }}
+          {{ 'ip6' if ':' in nft_mgmt_allow_sources[0] else 'ip' }} saddr
+          {{ '{ ' ~ nft_mgmt_allow_sources | join(', ') ~ ' }' if nft_mgmt_allow_sources | length > 1 else nft_mgmt_allow_sources[0] }}
+          tcp dport {{ nft_mgmt_detected_port | default('', true) | ternary(nft_mgmt_detected_port, ssh_port | default(22)) }}
+          ct state { new, established }
+
+    # A single whole-template expression keeps order an integer, so the
+    # template can sort it against the other rules.
+    - name: Build the management allow rule
+      ansible.builtin.set_fact:
+        nft_mgmt_rules: >-
+          {{
+            {
+              nft_mgmt_rule_name: {
+                'order': nft_mgmt_order | int,
+                'family': nft_mgmt_family,
+                'table': nft_mgmt_table,
+                'chain': nft_mgmt_chain,
+                'expr': nft_mgmt_expr | trim,
+                'action': 'accept',
+                'comment': 'Keep the active management path reachable'
+              }
+            }
+          }}
+
+- name: Warn about applying rules without a rollback net
+  ansible.builtin.debug:
+    msg: >-
+      nft_rollback_enabled is false: nothing will restore this host if the new
+      ruleset cuts the control connection, because the rescue path needs a
+      working connection too. Keep out-of-band access ready.
+  when: not nft_rollback_enabled | bool
+
+# Both probes run one after another, so the worst case is their sum plus the
+# connect timeout, not a single timeout.
+- name: Keep the rollback timeout longer than the reachability checks
+  vars:
+    # Each ternary is fully parenthesised: "|" binds looser than "+" in Jinja,
+    # so an unparenthesised sum ends up inside the filter call.
+    nft_check_probes: >-
+      {{ ((nft_ssh_check_connection | bool) | ternary(1, 0)) + ((nft_ssh_check_tcp | bool) | ternary(1, 0)) }}
+    nft_check_budget: "{{ (nft_ssh_check_timeout | int) * (nft_check_probes | int) }}"
+  ansible.builtin.assert:
+    that:
+      - (nft_check_budget | int) + 15 < (nft_rollback_timeout | int)
+    # Kept on one indentation level: a more indented continuation would keep its
+    # newline and break the sentence apart.
+    fail_msg: >-
+      The enabled reachability checks can take up to {{ nft_check_budget }}s,
+      which leaves no room before nft_rollback_timeout
+      ({{ nft_rollback_timeout }}s): the timer would roll back while the checks
+      are still running and commit would fail on an otherwise healthy host.
+      Raise nft_rollback_timeout or lower nft_ssh_check_timeout.
+    quiet: true
+  when:
+    - nft_timeout_assert_enabled | bool
+    - nft_rollback_enabled | bool
+    - nft_ssh_check_enabled | bool
+    - nft_rollback_timeout | string is match('^[0-9]+$')

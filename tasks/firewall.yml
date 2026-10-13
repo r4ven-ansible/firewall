@@ -39,6 +39,9 @@
 - name: Prepare nftables ruleset
   tags: [firewall, nft_rules, nft_config, nft_apply]
   block:
+    - name: Protect the management path before rendering rules
+      ansible.builtin.import_tasks: preflight.yml
+
     - name: Initialize allowed port rules
       ansible.builtin.set_fact:
         nft_allowed_port_rules: {}
@@ -112,31 +115,82 @@
           }}
       when: nft_allowed_ports | length > 0
 
+    # The management rule is merged first, so an explicit override or null in
+    # nft_rules_extra/nft_rules_host still wins over the autodetected one.
     - name: Merge nftables rules dictionaries
       ansible.builtin.set_fact:
         nft_rules_final: >-
           {{
             nft_rules
+            | combine(nft_mgmt_rules, recursive=True)
             | combine(nft_allowed_port_rules, recursive=True)
             | combine(nft_rules_extra, recursive=True)
+            | combine(nft_rules_host, recursive=True)
           }}
 
     - name: Remove null rules
       ansible.builtin.set_fact:
         nft_rules_final: "{{ nft_rules_final | dict2items | rejectattr('value', 'none') | items2dict }}"
 
+    - name: Collect other rule orders in the management chain
+      ansible.builtin.set_fact:
+        nft_mgmt_other_orders: >-
+          {{ nft_rules_final | dict2items
+             | rejectattr('key', 'equalto', nft_mgmt_rule_name)
+             | selectattr('value.family', 'defined')
+             | selectattr('value.table', 'defined')
+             | selectattr('value.chain', 'defined')
+             | selectattr('value.family', 'equalto', nft_mgmt_family)
+             | selectattr('value.table', 'equalto', nft_mgmt_table)
+             | selectattr('value.chain', 'equalto', nft_mgmt_chain)
+             | map(attribute='value.order') | map('int') | list }}
+      when: nft_mgmt_rule_name in nft_rules_final
+
+    - name: Keep the management allow rule ahead of every rule in its chain
+      ansible.builtin.assert:
+        that:
+          - nft_mgmt_other_orders | length == 0
+            or (nft_rules_final[nft_mgmt_rule_name].order | int) < (nft_mgmt_other_orders | min)
+        fail_msg: >-
+          {{ nft_mgmt_rule_name }} has order
+          {{ nft_rules_final[nft_mgmt_rule_name].order }}, which is not ahead of
+          every rule in {{ nft_mgmt_family }}/{{ nft_mgmt_table }}/{{ nft_mgmt_chain }}
+          (lowest other order: {{ nft_mgmt_other_orders | min }}). An earlier
+          drop or jump could cut the connection that is applying the rules.
+          Lower nft_mgmt_order.
+        quiet: true
+      when: nft_mgmt_rule_name in nft_rules_final
+
 
 - name: Apply nftables transaction
   ansible.builtin.import_tasks: apply.yml
   tags: [firewall, nft_config, nft_apply]
 
+# Started as well as enabled: otherwise the committed rules live only in the
+# kernel, and the unit state says nothing about whether they were ever loaded.
 - name: Enable nftables
   ansible.builtin.systemd_service:
     name: nftables
     enabled: true
     masked: false
+    state: started
   when: "not ansible_check_mode or (nft_binary | default({'stat': {'exists': false}})).stat.exists"
   tags: [firewall, nft_systemd, nft_apply]
+
+# Recorded after the service start, so the baseline is the state the host will
+# actually boot with, not the one that existed mid-transaction. Only written
+# when this run owns that state: blessing a drifted ruleset would disable the
+# detector instead of reporting it.
+- name: Record the runtime drift baseline
+  ansible.builtin.command:
+    argv: ["{{ nft_state_dir }}/fingerprint", store]
+  changed_when: false
+  when:
+    - nft_drift_check_enabled | bool
+    - not ansible_check_mode
+    - "(nft_binary | default({'stat': {'exists': false}})).stat.exists"
+    - (nft_apply_required | default(false) | bool) or (nft_fingerprint.stdout | default('') == 'unknown')
+  tags: [firewall, nft_config, nft_apply]
 
 - name: Restart docker
   ansible.builtin.systemd_service:

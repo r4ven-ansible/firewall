@@ -22,15 +22,82 @@
   register: nft_config_copied
   diff: true
 
+# Also holds the transaction directories, so it must exist even when drift
+# detection is turned off.
+- name: Create persistent firewall state directory
+  ansible.builtin.file:
+    path: "{{ nft_state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  when: not ansible_check_mode
+
+- name: Detect runtime drift
+  when:
+    - nft_drift_check_enabled | bool
+    - nft_binary.stat.exists
+    - not ansible_check_mode
+  block:
+    - name: Install ruleset fingerprint helper
+      ansible.builtin.template:
+        src: fingerprint.py.j2
+        dest: "{{ nft_state_dir }}/fingerprint"
+        owner: root
+        group: root
+        mode: '0700'
+
+    # Compares the live ruleset with the one this role last committed, ignoring
+    # counters, handles and dynamic set contents, so a manual flush or reload is
+    # noticed instead of being hidden behind an unchanged config file.
+    - name: Compare the live ruleset with the last committed one
+      ansible.builtin.command:
+        argv: ["{{ nft_state_dir }}/fingerprint", status]
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      register: nft_fingerprint
+
+    - name: Report an unusable drift baseline
+      ansible.builtin.debug:
+        msg: >-
+          No usable drift baseline ({{ nft_state_dir }}/applied.fingerprint is
+          missing or unreadable, or the fingerprint helper failed). Runtime
+          drift cannot be detected for this run; the current state becomes the
+          baseline once the role is done.
+      when: nft_fingerprint.stdout | default('') != 'match'
+            and nft_fingerprint.stdout | default('') != 'drift'
+
+    - name: Report drifted runtime ruleset
+      ansible.builtin.debug:
+        msg: >-
+          The live nftables ruleset no longer matches the one this role
+          committed ({{ nft_state_dir }}/applied.fingerprint). Reapplying the
+          rendered configuration.
+      when: nft_fingerprint.stdout | default('') == 'drift'
+
+- name: Decide whether the transaction has to run
+  ansible.builtin.set_fact:
+    nft_apply_required: >-
+      {{ (nft_config_copied.changed
+          or nft_force_apply | bool
+          or (nft_fingerprint.stdout | default('')) == 'drift')
+         and not ansible_check_mode }}
+
 - name: Apply changed configuration safely
-  when: nft_config_copied.changed and not ansible_check_mode
+  when: nft_apply_required | bool
   block:
     - name: Create private transaction directory
       ansible.builtin.tempfile:
         state: directory
+        path: "{{ nft_state_dir }}"
         prefix: nft-transaction-
       register: nft_transaction
       changed_when: false
+
+    - name: Set unique rollback unit name
+      ansible.builtin.set_fact:
+        nft_transaction_unit: "{{ nft_rollback_unit }}-{{ nft_transaction.path | basename }}"
 
     - name: Stage and validate new configuration
       ansible.builtin.template:
@@ -50,14 +117,24 @@
           cd {{ nft_transaction.path | quote }}
           exec 9>lock
           flock -x 9
+          self={{ (nft_transaction.path ~ '/transaction') | quote }}
           config={{ nft_config_path | quote }}
           nft={{ nft_bin | quote }}
           history={{ nft_backup_path | quote }}
+          unit={{ nft_transaction_unit | quote }}
+          boot_unit="$unit-boot"
           mark() { printf '%s\n' "$1" > state.new; mv -f state.new state; }
+          lost_connection() {
+              echo "Transaction state is '$1', not 'pending': the rollback timer already fired or the transaction was rolled back. The control connection was most likely lost after the new rules were applied, so the independent timer restored the previous state." >&2
+          }
           require_pending() {
+              if test ! -f state; then
+                  echo "Transaction state file is missing in $PWD: the transaction directory was removed or never prepared." >&2
+                  return 1
+              fi
               current=$(cat state)
               if test "$current" != pending; then
-                  echo "Transaction state is '$current', not 'pending': the rollback timer already fired or the transaction was rolled back. The control connection was most likely lost after the new rules were applied (for example, a private-network admin address blocked by the WAN spoof guards)." >&2
+                  lost_connection "$current"
                   return 1
               fi
           }
@@ -75,83 +152,167 @@
                   masked-runtime) systemctl mask --runtime nftables.service || return 1 ;;
               esac
           }
+          # Two overlapping transactions would snapshot each other's applied
+          # rules as the original state, and the older timer would then undo the
+          # newer commit. Finished neighbours are garbage; armed ones are a stop.
+          check_siblings() {
+              for dir in {{ nft_state_dir | quote }}/nft-transaction-*; do
+                  test -d "$dir" || continue
+                  test "$dir" != {{ nft_transaction.path | quote }} || continue
+                  sibling=$(cat "$dir/state" 2>/dev/null || echo unknown)
+                  case "$sibling" in
+                      committed|rolled-back|unknown)
+                          "$dir/transaction" disarm 2>/dev/null || true
+                          rm -rf -- "$dir"
+                          ;;
+                      *)
+                          echo "Another transaction in $dir is still '$sibling'. Resolve it first ('$dir/transaction rollback' or, once the state is understood, '$dir/transaction disarm' and remove the directory): its rollback timer would undo this transaction." >&2
+                          return 1
+                          ;;
+                  esac
+              done
+          }
+          do_prepare() {
+              # Ansible retries a task after an SSH blip; re-snapshotting would
+              # capture the already applied rules as the original state.
+              if test -e state; then
+                  require_pending
+                  return 0
+              fi
+              check_siblings
+              # Capture the live rules, not the potentially stale config.
+              printf 'flush ruleset\n' > runtime
+              "$nft" list ruleset >> runtime
+              if test -e "$config" || test -L "$config"; then
+                  cp -a -- "$config" original
+                  cp -pL -- "$config" original-content
+                  touch had-config
+              fi
+              service_state=$(systemctl is-enabled nftables.service || true)
+              case "$service_state" in
+                  enabled|enabled-runtime|disabled|masked|masked-runtime|static|indirect) ;;
+                  *) echo "Unsupported nftables unit state: $service_state" >&2; exit 1 ;;
+              esac
+              printf '%s\n' "$service_state" > masked
+              # is-enabled reports masked even when enablement links remain.
+              if find /etc/systemd/system -type l \( -path '*.wants/nftables.service' -o -path '*.requires/nftables.service' \) | grep -q .; then
+                  echo enabled > enabled
+              elif find /run/systemd/system -type l \( -path '*.wants/nftables.service' -o -path '*.requires/nftables.service' \) | grep -q .; then
+                  echo enabled-runtime > enabled
+              else
+                  printf '%s\n' "$service_state" > enabled
+              fi
+              mark pending
+          }
+          do_arm() {
+              require_pending
+              # Re-arming after an Ansible retry would clash with the existing
+              # transient unit name, including when a previous attempt died
+              # between systemd-run and the marker.
+              if test -e armed || systemctl is-active --quiet "$unit.timer"; then
+                  touch armed
+                  return 0
+              fi
+              systemd-run --collect "--unit=$unit" \
+                  "--on-active={{ nft_rollback_timeout }}" \
+                  "--timer-property=AccuracySec={{ nft_rollback_accuracy }}" \
+                  "$self" rollback
+              {% if nft_rollback_on_boot | bool %}
+              # A reboot inside the window would leave no rules and a masked
+              # service behind, and transient timers do not survive it.
+              printf '%s\n' \
+                  '[Unit]' \
+                  'Description=Restore pre-transaction nftables state after an unexpected reboot' \
+                  '[Service]' \
+                  'Type=oneshot' \
+                  "ExecStart=$self boot-rollback" \
+                  > "/etc/systemd/system/$boot_unit.service"
+              printf '%s\n' \
+                  '[Unit]' \
+                  'Description=Restore pre-transaction nftables state after an unexpected reboot' \
+                  '[Timer]' \
+                  'OnBootSec={{ nft_rollback_on_boot_delay }}' \
+                  'AccuracySec=1s' \
+                  '[Install]' \
+                  'WantedBy=timers.target' \
+                  > "/etc/systemd/system/$boot_unit.timer"
+              systemctl daemon-reload
+              systemctl enable "$boot_unit.timer"
+              {% endif %}
+              touch armed
+          }
+          do_disarm() {
+              rm -f armed
+              systemctl stop "$unit.timer" "$unit.service" 2>/dev/null || true
+              if test -e "/etc/systemd/system/$boot_unit.timer"; then
+                  systemctl disable "$boot_unit.timer" 2>/dev/null || true
+                  rm -f "/etc/systemd/system/$boot_unit.timer" "/etc/systemd/system/$boot_unit.service"
+                  systemctl daemon-reload
+              fi
+          }
+          do_apply() {
+              require_pending
+              if test -e had-config && ! cmp -s original-content candidate; then
+                  install -d -m 0700 -- "$history"
+                  hash=$(sha256sum original-content)
+                  hash=${hash%% *}
+                  backup="$history/$(basename "$config")_$hash"
+                  # Repeated configs neither create nor refresh history entries.
+                  if test ! -e "$backup"; then
+                      cp -- original-content "$history/.{{ nft_transaction.path | basename }}"
+                      chmod 0600 "$history/.{{ nft_transaction.path | basename }}"
+                      mv -f -- "$history/.{{ nft_transaction.path | basename }}" "$backup"
+                  fi
+              fi
+              install -d -- "$(dirname "$config")"
+              install -m 0600 -- candidate "$config.{{ nft_transaction.path | basename }}"
+              mv -f -- "$config.{{ nft_transaction.path | basename }}" "$config"
+              systemctl mask nftables.service
+              "$nft" -f "$config"
+          }
+          do_commit() {
+              # A timer that won the lock makes commit fail, even after the
+              # reachability checks succeeded.
+              if test "$(cat state)" = committed; then
+                  return 0
+              fi
+              require_pending
+              systemctl unmask nftables.service
+              systemctl unmask --runtime nftables.service
+              systemctl enable nftables.service
+              mark committed
+          }
+          do_rollback() {
+              case "$(cat state)" in
+                  committed|rolled-back) return 0 ;;
+                  pending|rollback-failed) ;;
+                  *) return 1 ;;
+              esac
+              mark rollback-failed
+              failed=0
+              if test -e had-config; then
+                  rm -f -- "$config" && cp -a -- original "$config" || failed=1
+              else
+                  rm -f -- "$config" || failed=1
+              fi
+              # Attempt all restores, even if one fails.
+              (set -e; restore_service) || failed=1
+              "$nft" -f runtime || failed=1
+              test "$failed" = 0 || return 1
+              mark rolled-back
+          }
           case "$1" in
-              prepare)
-                  test ! -e state
-                  # Capture the live rules, not the potentially stale config.
-                  printf 'flush ruleset\n' > runtime
-                  "$nft" list ruleset >> runtime
-                  if test -e "$config" || test -L "$config"; then
-                      cp -a -- "$config" original
-                      cp -pL -- "$config" original-content
-                      touch had-config
-                  fi
-                  service_state=$(systemctl is-enabled nftables.service || true)
-                  case "$service_state" in
-                      enabled|enabled-runtime|disabled|masked|masked-runtime|static|indirect) ;;
-                      *) echo "Unsupported nftables unit state: $service_state" >&2; exit 1 ;;
-                  esac
-                  printf '%s\n' "$service_state" > masked
-                  # is-enabled reports masked even when enablement links remain.
-                  if find /etc/systemd/system -type l \( -path '*.wants/nftables.service' -o -path '*.requires/nftables.service' \) | grep -q .; then
-                      echo enabled > enabled
-                  elif find /run/systemd/system -type l \( -path '*.wants/nftables.service' -o -path '*.requires/nftables.service' \) | grep -q .; then
-                      echo enabled-runtime > enabled
-                  else
-                      printf '%s\n' "$service_state" > enabled
-                  fi
-                  mark pending
-                  ;;
-              apply)
-                  test "$(cat state)" = pending
-                  if test -e had-config && ! cmp -s original-content candidate; then
-                      install -d -m 0700 -- "$history"
-                      hash=$(sha256sum original-content)
-                      hash=${hash%% *}
-                      backup="$history/$(basename "$config")_$hash"
-                      # Repeated configs neither create nor refresh history entries.
-                      if test ! -e "$backup"; then
-                          cp -- original-content "$history/.{{ nft_transaction.path | basename }}"
-                          chmod 0600 "$history/.{{ nft_transaction.path | basename }}"
-                          mv -f -- "$history/.{{ nft_transaction.path | basename }}" "$backup"
-                      fi
-                  fi
-                  install -d -- "$(dirname "$config")"
-                  install -m 0600 -- candidate "$config.{{ nft_transaction.path | basename }}"
-                  mv -f -- "$config.{{ nft_transaction.path | basename }}" "$config"
-                  systemctl mask nftables.service
-                  "$nft" -f "$config"
-                  ;;
-              commit)
-                  # A timer that won the lock makes commit fail, even after SSH succeeds.
-                  require_pending
-                  systemctl unmask nftables.service
-                  systemctl unmask --runtime nftables.service
-                  systemctl enable nftables.service
-                  mark committed
-                  ;;
-              check)
-                  require_pending
-                  ;;
-              rollback)
-                  case "$(cat state)" in
-                      committed|rolled-back) exit 0 ;;
-                      pending|rollback-failed) ;;
-                      *) exit 1 ;;
-                  esac
-                  mark rollback-failed
-                  failed=0
-                  if test -e had-config; then
-                      rm -f -- "$config" && cp -a -- original "$config" || failed=1
-                  else
-                      rm -f -- "$config" || failed=1
-                  fi
-                  # Attempt all restores, even if one fails.
-                  (set -e; restore_service) || failed=1
-                  "$nft" -f runtime || failed=1
-                  test "$failed" = 0
-                  mark rolled-back
-                  ;;
+              prepare) do_prepare ;;
+              arm) do_arm ;;
+              apply) do_apply ;;
+              commit) do_commit; do_disarm ;;
+              check) require_pending ;;
+              rollback) do_rollback ;;
+              # Runs from the persistent on-boot unit. It removes itself only
+              # after a successful restore: a failed one must stay armed for the
+              # next boot instead of silently giving up.
+              boot-rollback) do_rollback; do_disarm ;;
+              disarm) do_disarm ;;
               *) exit 2 ;;
           esac
       changed_when: false
@@ -162,32 +323,26 @@
       changed_when: false
       register: nft_snapshot
 
-    - name: Set unique rollback unit name
-      ansible.builtin.set_fact:
-        nft_transaction_unit: "{{ nft_rollback_unit }}-{{ nft_transaction.path | basename }}"
-
+    # Armed independently of the reachability checks: disabling them must not
+    # remove the only protection against an unreachable host.
     - name: Schedule independent firewall rollback
       ansible.builtin.command:
-        argv:
-          - systemd-run
-          - --collect
-          - "--unit={{ nft_transaction_unit }}"
-          - "--on-active={{ nft_rollback_timeout }}"
-          - "{{ nft_transaction.path }}/transaction"
-          - rollback
+        argv: ["{{ nft_transaction.path }}/transaction", arm]
       changed_when: false
-      when: nft_ssh_check_enabled | bool
+      when: nft_rollback_enabled | bool
 
     - name: Install and apply candidate under transaction lock
       ansible.builtin.command:
         argv: ["{{ nft_transaction.path }}/transaction", apply]
       changed_when: false
 
-    - name: Verify rollback has not started
-      ansible.builtin.command:
-        argv: ["{{ nft_transaction.path }}/transaction", check]
-      changed_when: false
-      when: nft_ssh_check_enabled | bool
+    # Included rather than inlined: meta tasks ignore their own "when", so the
+    # connection reset has to be gated by the include itself.
+    - name: Check reachability over Ansible's own connection path
+      ansible.builtin.include_tasks: reachability.yml
+      when:
+        - nft_ssh_check_enabled | bool
+        - nft_ssh_check_connection | bool
 
     - name: Check SSH reachability
       ansible.builtin.wait_for:
@@ -196,18 +351,16 @@
         timeout: "{{ nft_ssh_check_timeout }}"
       delegate_to: "{{ nft_ssh_check_delegate }}"
       become: false
-      when: nft_ssh_check_enabled | bool
+      when:
+        - nft_ssh_check_enabled | bool
+        - nft_ssh_check_tcp | bool
 
+    # Reaching commit means the runtime rules were replaced, which is a change
+    # even when the rendered file is identical (a drift reapply).
     - name: Commit only if rollback has not started
       ansible.builtin.command:
         argv: ["{{ nft_transaction.path }}/transaction", commit]
-      changed_when: false
-
-    - name: Stop committed rollback timer
-      ansible.builtin.command:
-        argv: [systemctl, stop, "{{ nft_transaction_unit }}.timer"]
-      changed_when: false
-      when: nft_ssh_check_enabled | bool
+      changed_when: true
 
     - name: Remove committed transaction
       ansible.builtin.file:
@@ -232,6 +385,8 @@
           Rollback rc={{ nft_immediate_rollback.rc | default('not attempted') }}.
           Transaction snapshots remain in {{ nft_transaction.path | default('not created') }};
           any armed timer is left intact; failed restoration requires investigation.
+          Clean up with "{{ nft_transaction.path | default('<transaction>') }}/transaction disarm"
+          once the state is understood.
 
 - name: Find configuration history after a successful change
   ansible.builtin.find:
@@ -239,7 +394,7 @@
     patterns: "{{ nft_config_path | basename }}_*"
     file_type: file
   register: nft_history
-  when: nft_config_copied.changed and not ansible_check_mode
+  when: nft_apply_required | bool
 
 - name: Rotate old configuration history
   ansible.builtin.file:
@@ -248,5 +403,5 @@
   loop: "{{ (nft_history.files | default([]) | sort(attribute='mtime', reverse=true))[nft_backup_keep | int:] }}"
   loop_control:
     label: "{{ item.path }}"
-  when: nft_config_copied.changed and not ansible_check_mode
+  when: nft_apply_required | bool
   changed_when: false

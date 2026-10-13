@@ -8,7 +8,12 @@ python3 tests/run_vm.py --host 192.168.122.241 --user lans --reboot
 
 The runner uses Python's standard library and the controller's `ansible-playbook`. It creates its own inventory, playbook, Ansible configuration, SSH ControlMaster socket and logs in `/tmp/firewall-vm-*`. It does **not** load the repository inventory, host vars, or secrets. The playbook explicitly loads only `examples/inventory/group_vars/all/firewall.yml` via `vars_files`. Connection variables come from the generated single-host inventory.
 
-Overrides make the controller a WAN source: `192.168.0.0/16` is excluded from `nft_lan4_networks`, trusted is `203.0.113.123`, and all four input/forward spoof rules are removed with `null`. Original SSH flood rules are enabled only in the flood scenario; other scenarios remove them to avoid consuming management connection budget.
+The shipped baseline runs as published: all four input/forward spoof guards stay enabled and `nft_lan4_networks` keeps `192.168.0.0/16`, which contains this VM's management source. Every scenario therefore doubles as a regression test for the lockout that used to make a first rollout roll back. Trusted is `203.0.113.123`. Original SSH flood rules are enabled only in the flood scenario; other scenarios remove them to avoid consuming management connection budget.
+
+Two overrides exist because the baseline classifies an on-link private source as a LAN neighbour, not as WAN:
+
+- `wan_view` (`nft_lan4_networks` without `192.168.0.0/16`) is used by the scenarios that assert WAN-side behaviour: WAN port policy and live probes, per-source SSH flood limits, and denial of new WAN SSH.
+- `unprotected` (`nft_mgmt_allow_enabled: false` plus empty `nft_wan_local4_networks`) reproduces the original incident. Both the management allow rule and the on-link spoof exceptions prevent it independently, so both have to be off for the host to lock itself out.
 
 ## Safety and artifacts
 
@@ -22,9 +27,57 @@ ssh lans@192.168.122.241 'sudo -n /root/firewall-vm-RUN_ID/restore'
 
 The suite is destructive: flushes the ruleset, replaces `/etc/nftables.conf`, temporarily replaces history, removes/reinstalls `nftables`, optionally reboots, and briefly blocks **all** SSH traffic including established sessions. Do not run alongside other firewall changes. The default target is the authorized test VM, not production.
 
-## Previous integration run before standalone packaging (2026-10-13)
+## Integration run after the safety rework (2026-10-14)
 
-The following run used the original project layout. After packaging, the runner paths were adapted; the destructive VM suite has not been rerun in this repository.
+```sh
+python3 tests/run_vm.py --host 192.168.122.241 --user lans --reboot
+```
+
+Target: `lans@192.168.122.241`, Debian 13 (`debian13-nft`). Logs:
+`/tmp/firewall-vm-42siz41l`; machine-readable results:
+`/tmp/firewall-vm-42siz41l/results.json`; original VM snapshot:
+`/root/firewall-vm-42siz41l`. Runner exit status **0** (**22 PASS, 0 FAIL**),
+original config absence, runtime, service state and history restored.
+
+| Scenario | Result |
+|---|---|
+| Baseline apply with the shipped spoof guards enabled and `192.168.0.0/16` in `nft_lan4_networks`, timer/transaction/boot-unit cleanup | PASS |
+| Identical tagged reapply: `changed=0`, config/runtime/history untouched | PASS |
+| `-t nft_apply --check --diff`: expected TCP/UDP diff, unchanged state | PASS |
+| Invalid nft syntax: nonzero rc, unchanged state | PASS |
+| Deny new SSH while established management survives: immediate rescue rollback | PASS |
+| Drop all SSH including established: nonzero rc, independent timer restores config/runtime/enabled unmasked service | PASS |
+| Timer wins while a delayed probe later succeeds: commit refuses and names the lost connection instead of failing blankly | PASS |
+| Extra add/change/null, `nft_rules_host`, allowed ports, management rule rendered first, all four guards present | PASS |
+| WAN live TCP allow/deny and UDP echo probes | PASS |
+| Four changed configs: content hash, backup mtime, retention, mode 0600, repeat idempotence | PASS |
+| Real SSH burst: per-source limit measurable with the management rule off, source in the dynamic set | PASS |
+| Real `dpkg --remove nftables`: `LoadState=not-found`, full `--check --diff` changes nothing, apt reinstall | PASS |
+| Baseline guards with both protections off: lockout reproduced and rolled back | PASS |
+| Reachability checks disabled: rollback still armed and restores | PASS |
+| Manual `nft flush ruleset`: drift detected, reapplied, reported as changed, idempotent afterwards | PASS |
+| `ssh_port` not matching the live sshd listener: refused before any change | PASS |
+| Reachability probe over Ansible's own connection path (reset + reconnect) | PASS |
+| Armed neighbour transaction refuses a new one; finished neighbours collected | PASS |
+| Reachability timeout past the rollback timer: refused before any change | PASS |
+| No active rollback timer, boot unit or transaction directory before reboot | PASS |
+| Changed apply, then reboot: boot ID changes, same config hash, nftables enabled/active, filter table loaded | PASS |
+| Final original config/runtime/service/history restoration | PASS |
+
+Four earlier rounds of this suite found, in order: the WAN-side scenarios had to
+stop assuming the controller is a WAN source (it is an on-link neighbour in the
+baseline); OpenSSH 9.8+ `PerSourcePenalties` blocks the controller after an
+unauthenticated burst and poisons later scenarios unless drained; a drift reapply
+reported `changed=0` because every transaction task is `changed_when: false`; a
+fail_msg sentence was broken apart by YAML folding and an unparenthesised
+`ternary` sum; and — found by the package scenario hanging on `apt` — the spoof
+guards sitting before `allow_established` drop reply traffic from a resolver or
+gateway on a private uplink. The first two were fixed in the runner, the rest in
+the role.
+
+## Earlier integration run, before the safety rework (2026-10-13)
+
+The table below is the run of the previous role version, kept for comparison. It predates the management allow rule, the independent rollback arming, the persistent on-boot restore, drift detection and the preflight asserts, and it ran with the four spoof guards neutralised by `null`. See the section after it for the current run.
 
 Equivalent command in this layout:
 
@@ -65,6 +118,8 @@ For baseline, extra rules, every history change, flood cleanup, and reboot setup
 Backup validation sets the source config mtime to 2000-01-01, records its hash and VM time, then verifies the content-addressed history entry has matching content and an mtime at or after the apply start. Identical reapply leaves config/runtime/history, including history mtimes, unchanged.
 
 ## Scope and limitations
+
+- The management allow rule, the on-link spoof exceptions, independent rollback arming, drift detection, the preflight asserts and `nft_rules_host` each have a scenario. Reported as untested: idempotence of `prepare`/`commit` under a real Ansible SSH retry (the retry is hard to provoke deterministically; the subcommands were reviewed and exercised by hand), and an actual reboot *inside* the transaction window. For the latter the suite verifies the mechanism instead: the persistent `nft-rollback-*-boot` units exist while a failed transaction stays armed, are gone after commit, and no unit or transaction directory is left behind before the reboot scenario.
 
 - Baseline, extra rules/WAN setup, history rotation/idempotence, flood cleanup, and changed reboot setup use the enabled role SSH safeguard. Only installation of the actual flood rules uses `nft_ssh_check_enabled: false`, keeping the independent emergency timer and established ControlMaster management; after the burst, limits are removed with role SSH-check enabled. Both real SSH rollback scenarios and the timer race also use the role safeguard.
 - Timer race uses a delayed local TCP listener as the reachability target to deterministically hold `wait_for` until rollback executes. Full real SSH loss is a separate scenario. systemd timer coalescing means the configured timeout is not a strict execution deadline; the race allows 110 seconds before listener availability.

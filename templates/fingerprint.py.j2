@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Fingerprint the managed nftables tables, ignoring state that moves by itself.
+
+Counters, handles and the contents of dynamic sets change without anyone
+touching the configuration, so they are scrubbed before hashing. Tables this
+role does not manage are ignored as well, so a container runtime rewriting its
+own tables is not mistaken for drift. What remains changes only when the managed
+ruleset does: a manual flush, a hand-written nft -f, or a service that never
+loaded the committed rules.
+
+Subcommands: show (print the digest), store (record it), status (match / drift /
+unknown, always rc=0).
+"""
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+NFT = {{ nft_bin | to_json }}
+MARKER = {{ (nft_state_dir ~ '/applied.fingerprint') | to_json }}
+MANAGED = [{% for table in nft_tables %}[{{ table.family | to_json }}, {{ table.name | to_json }}]{{ ", " if not loop.last else "" }}{% endfor %}]
+
+
+def scrub(node):
+    if isinstance(node, dict):
+        out = {}
+        for key, value in node.items():
+            if key == "handle":
+                continue
+            if key == "counter" and isinstance(value, dict):
+                out[key] = {}
+                continue
+            out[key] = scrub(value)
+        return out
+    if isinstance(node, list):
+        return [scrub(item) for item in node]
+    return node
+
+
+def managed(kind, body):
+    if not isinstance(body, dict):
+        return False
+    table = body.get("name") if kind == "table" else body.get("table")
+    return [body.get("family"), table] in MANAGED
+
+
+def digest():
+    raw = subprocess.run(
+        [NFT, "-j", "list", "ruleset"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    kept = []
+    for item in json.loads(raw)["nftables"]:
+        if "metainfo" in item:
+            continue
+        kind, body = next(iter(item.items()))
+        if not managed(kind, body):
+            continue
+        if kind in ("set", "map"):
+            if "dynamic" in (body.get("flags") or []):
+                body = {k: v for k, v in body.items() if k != "elem"}
+            elif isinstance(body.get("elem"), list):
+                # A reload can list the same elements in another order.
+                body = dict(body, elem=sorted(
+                    body["elem"], key=lambda entry: json.dumps(entry, sort_keys=True)))
+        kept.append(scrub({kind: body}))
+    canonical = json.dumps(kept, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else "show"
+    if action == "status":
+        try:
+            with open(MARKER) as handle:
+                recorded = handle.read().strip()
+            print("match" if recorded == digest() else "drift")
+        except Exception:
+            print("unknown")
+        return 0
+    current = digest()
+    if action == "show":
+        print(current)
+        return 0
+    if action == "store":
+        tmp = MARKER + ".new"
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+            handle.write(current + "\n")
+        os.replace(tmp, MARKER)
+        return 0
+    print("usage: fingerprint show|store|status", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

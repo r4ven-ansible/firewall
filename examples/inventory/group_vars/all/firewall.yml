@@ -42,6 +42,33 @@ nft_sets:
     flags: interval
     elements: "{{ nft_trusted_ips }}"
 
+  - family: inet
+    table: filter
+    name: trusted6
+    type: ipv6_addr
+    flags: interval
+    elements: "{{ nft_trusted_ips6 }}"
+
+  # Exceptions to the WAN spoof guards. Empty by default: exempting a private
+  # source from the guard also lets it reach input_lan, which accepts
+  # everything, so the whole on-link subnet would become trusted. Fill these
+  # only for a segment you actually trust.
+  - family: inet
+    table: filter
+    name: wan_local4
+    type: ipv4_addr
+    flags: interval
+    auto_merge: true
+    elements: "{{ nft_wan_local4_networks }}"
+
+  - family: inet
+    table: filter
+    name: wan_local6
+    type: ipv6_addr
+    flags: interval
+    auto_merge: true
+    elements: "{{ nft_wan_local6_networks }}"
+
   # per-source SSH rate limiting
   - family: inet
     table: filter
@@ -73,6 +100,16 @@ nft_lan6_networks:
 
 nft_trusted_ips:
   - 203.0.113.10
+
+nft_trusted_ips6: []
+
+# Opt-in. The role derives the WAN interface's own networks into nft_wan_local4
+# (IPv4 networks) and its addresses into nft_wan_local6 (single addresses, not
+# subnets), so trusting the on-link segment is one override away:
+#   nft_wan_local4_networks: "{{ nft_wan_local4 }}"
+# Management access does not need this: mgmt_allow_current already protects it.
+nft_wan_local4_networks: []
+nft_wan_local6_networks: []
 
 
 # CHAINS
@@ -158,31 +195,65 @@ nft_rules:
     action: drop
     comment: "Drop invalid connections"
 
-  # ---- WAN SPOOFING GUARD ----
-  # must run before allow_established so spoofed packets cannot
-  # piggyback on existing conntrack entries
-  drop_wan_spoofed_lan_ipv4:
-    order: 12
+  # ---- PRE-GUARD ESSENTIALS ----
+  # IPv6 on a link cannot work without neighbour discovery, and the sources are
+  # link-local, which the spoof guard drops. Accepting the ND types ahead of it
+  # keeps IPv6 working without exempting link-local from the guard itself.
+  allow_icmp6_nd:
+    order: 5
     family: inet
     table: filter
     chain: input
-    expr: 'iifname "{{ nft_wan_interface }}" ip saddr @lan4'
-    action:
-      jump: log_drop
-    comment: "Drop spoofed private IPv4 from WAN"
+    match:
+      meta:
+        l4proto: ipv6-icmp
+      icmpv6:
+        type:
+          - nd-router-solicit
+          - nd-router-advert
+          - nd-neighbor-solicit
+          - nd-neighbor-advert
+    action: accept
+    comment: "Allow IPv6 neighbour discovery"
 
-  drop_wan_spoofed_lan_ipv6:
-    order: 13
+  # A DHCP-addressed host loses its lease without these: a unicast renew reply
+  # from a private server is dropped by the guard before allow_established, and
+  # broadcast rebind replies match no conntrack entry at all. Bound to the WAN
+  # interface; a host that leases on another interface needs its own rule.
+  allow_dhcp_client4:
+    order: 6
     family: inet
     table: filter
     chain: input
-    expr: 'iifname "{{ nft_wan_interface }}" ip6 saddr @lan6'
-    action:
-      jump: log_drop
-    comment: "Drop spoofed private IPv6 from WAN"
+    match:
+      iifname: "{{ nft_wan_interface }}"
+      meta:
+        l4proto: udp
+      udp:
+        sport: 67
+        dport: 68
+    action: accept
+    comment: "Allow DHCPv4 client replies"
+
+  allow_dhcp_client6:
+    order: 7
+    family: inet
+    table: filter
+    chain: input
+    match:
+      iifname: "{{ nft_wan_interface }}"
+      meta:
+        l4proto: udp
+      ip6:
+        saddr: "fe80::/10"
+      udp:
+        sport: 547
+        dport: 546
+    action: accept
+    comment: "Allow DHCPv6 client replies"
 
   allow_established:
-    order: 20
+    order: 15
     family: inet
     table: filter
     chain: input
@@ -191,6 +262,35 @@ nft_rules:
         state: [established, related]
     action: accept
     comment: "Allow established connections"
+
+  # ---- WAN SPOOFING GUARD ----
+  # Private sources arriving on the WAN interface are spoofed unless the
+  # operator says otherwise through @wan_local4/@wan_local6, which are empty by
+  # default. The guards sit after allow_established on purpose: a resolver,
+  # gateway or NTP server on a private uplink is a legitimate peer for traffic
+  # this host started, and dropping those replies breaks the host itself. New
+  # and untracked traffic from private sources is still dropped, and what must
+  # survive beyond conntrack is accepted ahead of the guards: management
+  # (order 1), NDP (5) and DHCP replies (6, 7).
+  drop_wan_spoofed_lan_ipv4:
+    order: 20
+    family: inet
+    table: filter
+    chain: input
+    expr: 'iifname "{{ nft_wan_interface }}" ip saddr @lan4 ip saddr != @wan_local4'
+    action:
+      jump: log_drop
+    comment: "Drop spoofed private IPv4 from WAN"
+
+  drop_wan_spoofed_lan_ipv6:
+    order: 21
+    family: inet
+    table: filter
+    chain: input
+    expr: 'iifname "{{ nft_wan_interface }}" ip6 saddr @lan6 ip6 saddr != @wan_local6'
+    action:
+      jump: log_drop
+    comment: "Drop spoofed private IPv6 from WAN"
 
   allow_loopback:
     order: 30
@@ -213,6 +313,19 @@ nft_rules:
           value: "@trusted"
     action: accept
     comment: "Allow trusted IPs"
+
+  allow_trusted6:
+    order: 41
+    family: inet
+    table: filter
+    chain: input
+    match:
+      ip6:
+        saddr:
+          value: "@trusted6"
+    action: accept
+    comment: "Allow trusted IPv6 addresses"
+
 
   icmp4:
     order: 50
@@ -437,29 +550,8 @@ nft_rules:
     action: drop
     comment: "Drop invalid forwarded connections"
 
-  # spoofing guard must run before fwd_allow_established
-  fwd_drop_wan_spoofed_lan_ipv4:
-    order: 201
-    family: inet
-    table: filter
-    chain: forward
-    expr: 'iifname "{{ nft_wan_interface }}" ip saddr @lan4'
-    action:
-      jump: log_drop
-    comment: "Drop spoofed private IPv4 forwarded from WAN"
-
-  fwd_drop_wan_spoofed_lan_ipv6:
-    order: 202
-    family: inet
-    table: filter
-    chain: forward
-    expr: 'iifname "{{ nft_wan_interface }}" ip6 saddr @lan6'
-    action:
-      jump: log_drop
-    comment: "Drop spoofed private IPv6 forwarded from WAN"
-
   fwd_allow_established:
-    order: 205
+    order: 203
     family: inet
     table: filter
     chain: forward
@@ -468,6 +560,27 @@ nft_rules:
         state: [established, related]
     action: accept
     comment: "Allow established forwarded connections"
+
+  # After fwd_allow_established, for the same reason as in the input chain.
+  fwd_drop_wan_spoofed_lan_ipv4:
+    order: 205
+    family: inet
+    table: filter
+    chain: forward
+    expr: 'iifname "{{ nft_wan_interface }}" ip saddr @lan4 ip saddr != @wan_local4'
+    action:
+      jump: log_drop
+    comment: "Drop spoofed private IPv4 forwarded from WAN"
+
+  fwd_drop_wan_spoofed_lan_ipv6:
+    order: 206
+    family: inet
+    table: filter
+    chain: forward
+    expr: 'iifname "{{ nft_wan_interface }}" ip6 saddr @lan6 ip6 saddr != @wan_local6'
+    action:
+      jump: log_drop
+    comment: "Drop spoofed private IPv6 forwarded from WAN"
 
   # # Vritual interfaces
 
