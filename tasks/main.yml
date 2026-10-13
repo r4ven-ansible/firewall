@@ -3,9 +3,9 @@
 - name: Validate supported distribution
   ansible.builtin.assert:
     that:
-      - ansible_distribution in firewall_supported_distributions
+      - ansible_facts['distribution'] in firewall_supported_distributions
     fail_msg: >
-      Unsupported distribution: {{ ansible_distribution }}.
+      Unsupported distribution: {{ ansible_facts['distribution'] }}.
       Supported: {{ firewall_supported_distributions | join(', ') }}.
     quiet: true
   tags: [firewall, firewall_checks]

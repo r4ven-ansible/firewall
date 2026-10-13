@@ -19,8 +19,8 @@ nft_backup_path: /root/nft_backup
 nft_backup_keep: 10
 nft_validate_cmd: "{{ nft_bin }} -c -f %s"
 nft_wan_interface: >-
-  {{ ansible_default_ipv4.interface
-     | default(ansible_default_ipv6.interface | default('unknown0', true), true) }}
+  {{ ansible_facts.get('default_ipv4', {}).get('interface')
+     | default(ansible_facts.get('default_ipv6', {}).get('interface') | default('unknown0', true), true) }}
 
 # Rollback safety net: a transient systemd timer restores the previous
 # runtime ruleset, config (including absence), and service enablement/mask

@@ -9,7 +9,7 @@ nft_bin: "/usr/sbin/nft"
 nft_config_path: "/etc/nftables.conf"
 nft_backup_path: "/root/nft_backup"
 nft_validate_cmd: "{{ nft_bin }} -c -f %s"
-nft_wan_interface: "{{ ansible_default_ipv4.interface | default('unknown0', true) }}"
+nft_wan_interface: "{{ ansible_facts.get('default_ipv4', {}).get('interface') | default('unknown0', true) }}"
 
 # TABLES
 nft_tables:
