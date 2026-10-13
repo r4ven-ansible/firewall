@@ -54,6 +54,13 @@
           nft={{ nft_bin | quote }}
           history={{ nft_backup_path | quote }}
           mark() { printf '%s\n' "$1" > state.new; mv -f state.new state; }
+          require_pending() {
+              current=$(cat state)
+              if test "$current" != pending; then
+                  echo "Transaction state is '$current', not 'pending': the rollback timer already fired or the transaction was rolled back. The control connection was most likely lost after the new rules were applied (for example, a private-network admin address blocked by the WAN spoof guards)." >&2
+                  return 1
+              fi
+          }
           restore_service() {
               systemctl unmask nftables.service || return 1
               systemctl unmask --runtime nftables.service || return 1
@@ -117,11 +124,14 @@
                   ;;
               commit)
                   # A timer that won the lock makes commit fail, even after SSH succeeds.
-                  test "$(cat state)" = pending
+                  require_pending
                   systemctl unmask nftables.service
                   systemctl unmask --runtime nftables.service
                   systemctl enable nftables.service
                   mark committed
+                  ;;
+              check)
+                  require_pending
                   ;;
               rollback)
                   case "$(cat state)" in
@@ -173,6 +183,12 @@
         argv: ["{{ nft_transaction.path }}/transaction", apply]
       changed_when: false
 
+    - name: Verify rollback has not started
+      ansible.builtin.command:
+        argv: ["{{ nft_transaction.path }}/transaction", check]
+      changed_when: false
+      when: nft_ssh_check_enabled | bool
+
     - name: Check SSH reachability
       ansible.builtin.wait_for:
         host: "{{ nft_ssh_check_host }}"
@@ -211,7 +227,8 @@
     - name: Report failed transaction without claiming successful restoration
       ansible.builtin.fail:
         msg: >-
-          nftables transaction failed: {{ ansible_failed_result.msg | default(ansible_failed_result) }}.
+          nftables transaction failed: {{ ansible_failed_result.msg | default(ansible_failed_result) }}
+          {{ ansible_failed_result.stderr | default('') }}
           Rollback rc={{ nft_immediate_rollback.rc | default('not attempted') }}.
           Transaction snapshots remain in {{ nft_transaction.path | default('not created') }};
           any armed timer is left intact; failed restoration requires investigation.
