@@ -1,4 +1,0 @@
----
-roles:
-  - name: firewall
-    src: ./dist/firewall.tar.gz
