@@ -52,7 +52,7 @@ no release tags or remote URLs are assumed to exist.
 cd examples
 ansible-inventory --graph
 ansible-playbook playbooks/firewall.yml --syntax-check
-ansible-playbook playbooks/firewall.yml -l firewall_example --check --diff
+ansible-playbook playbooks/firewall.yml -l crow.r4ven.me --check --diff
 ```
 
 Before connecting, replace the documentation address/user in
