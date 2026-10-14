@@ -51,8 +51,9 @@ nft_sets:
 
   # Exceptions to the WAN spoof guards. Empty by default: exempting a private
   # source from the guard also lets it reach input_lan, which accepts
-  # everything, so the whole on-link subnet would become trusted. Fill these
-  # only for a segment you actually trust.
+  # everything, so the whole on-link subnet becomes trusted — including anyone
+  # able to ARP-spoof an address in it. Fill these only for a segment you
+  # actually trust, and prefer narrowing input_lan first.
   - family: inet
     table: filter
     name: wan_local4
@@ -251,6 +252,36 @@ nft_rules:
         dport: 546
     action: accept
     comment: "Allow DHCPv6 client replies"
+
+  # The guards run after allow_established, so a forged ICMP error carrying a
+  # live flow's tuple would be accepted as 'related'. Redirects are the one such
+  # message with real consequences (route injection, MITM), and no server needs
+  # to honour them; pair this with accept_redirects=0 in sysctl.
+  drop_icmp_redirect4:
+    order: 11
+    family: inet
+    table: filter
+    chain: input
+    match:
+      meta:
+        l4proto: icmp
+      icmp:
+        type: redirect
+    action: drop
+    comment: "Drop ICMP redirects"
+
+  drop_icmp_redirect6:
+    order: 12
+    family: inet
+    table: filter
+    chain: input
+    match:
+      meta:
+        l4proto: ipv6-icmp
+      icmpv6:
+        type: nd-redirect
+    action: drop
+    comment: "Drop ICMPv6 redirects"
 
   allow_established:
     order: 15

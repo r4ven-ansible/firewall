@@ -38,6 +38,17 @@
     nft_wan_facts: "{{ ansible_facts.get(nft_wan_interface | replace('-', '_') | replace('.', '_'), {}) }}"
   when: item.address is defined
 
+# A guard keyed on an interface that does not exist matches nothing and fails
+# silently, which looks exactly like protection.
+- name: Note an unknown WAN interface
+  ansible.builtin.debug:
+    msg: >-
+      nft_wan_interface is "{{ nft_wan_interface }}", which is not in this
+      host's facts. Rules keyed on it (the WAN spoof guards and the DHCP client
+      rules in the shipped baseline) will match nothing. Set nft_wan_interface
+      to the interface that actually carries the uplink.
+  when: ansible_facts.get(nft_wan_interface | replace('-', '_') | replace('.', '_'), {}) == {}
+
 # The management connection is read from the live session, not guessed from
 # inventory: with ProxyJump, NAT or a jump host the source the target actually
 # sees is not ansible_host.

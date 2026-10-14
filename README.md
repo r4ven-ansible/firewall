@@ -303,6 +303,16 @@ Together that is what makes the baseline safe to roll out on a host whose
 management address is private — it used to drop even the established admin
 session and roll back — without trusting anything else on the segment.
 
+The residual risk of that order is a forged packet matching a live conntrack
+entry: for TCP it needs the ephemeral port and a sequence inside the window, for
+UDP it is the same off-path race a public resolver already faces, and the one
+`related` message with real consequences is an ICMP redirect from a spoofed
+on-link gateway. The baseline drops redirects outright (order 11, 12); also set
+`net.ipv4.conf.all.accept_redirects=0` and `net.ipv6.conf.all.accept_redirects=0`
+in sysctl, which this role deliberately does not manage. Connection tracking
+helpers (FTP, SIP) would create the same kind of expected-flow exemption; the
+role does not enable any.
+
 The guards also honour exception sets, which are **empty by default**: exempting
 a private source from the guard also routes it into `input_lan`, whose baseline
 `input_lan_allow_all` accepts everything, so filling them trusts the whole
