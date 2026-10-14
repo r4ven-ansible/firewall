@@ -9,6 +9,9 @@ galaxy_info:
     - name: Debian
       versions:
         - trixie
+    - name: Ubuntu
+      versions:
+        - noble
   galaxy_tags:
     - networking
     - firewall

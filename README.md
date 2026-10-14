@@ -8,7 +8,8 @@ This is a standalone Ansible role: `tasks/`, `defaults/`, `templates/` and
 `meta/` are at the repository root. The launch project in the parent directory
 is preserved independently. No external roles or collections are required.
 Ansible Core 2.17 is the tested minimum; `requirements.txt` selects 2.19 for a
-new development environment. Debian 13 is the integration-tested platform.
+new development environment. `firewall_supported_distributions` accepts Debian,
+LMDE and Ubuntu; Debian 13 is the platform the integration suite runs on.
 
 ### Local installation (no publication required)
 
@@ -65,15 +66,33 @@ before using a private WAN or changing SSH access.
 ## Main Variables
 
 ```yaml
-firewall_enabled: false
+firewall_enabled: false          # the role does nothing until this is true
 nft_config_path: /etc/nftables.conf
+nft_bin: /usr/sbin/nft
+nft_validate_cmd: "{{ nft_bin }} -c -f %s"
 nft_tables: []
 nft_sets: []
 nft_maps: []
 nft_flowtables: []
 nft_chains: []
 nft_rules: {}
-nft_rules_extra: {}
+nft_rules_extra: {}             # group or host level additions and overrides
+nft_rules_host: {}              # host level, merged last
+nft_allowed_ports: []           # "80/tcp", "443/udp"; rendered into input_wan
+nft_allowed_ports_exclude_ssh: true
+```
+
+Packages, foreign firewalls and the full-flush mode:
+
+```yaml
+nft_packages: [nftables]
+nft_apt_update_cache: true
+nft_apt_cache_valid_time: 3600
+nft_remove_other_firewall: false # stop/disable ufw, firewalld, iptables,
+                                 # netfilter-persistent and purge ufw/firewalld
+nft_flush_ruleset: false         # prepend "flush ruleset": takes down every
+                                 # table, including a container runtime's
+nft_restart_docker: false        # required with nft_flush_ruleset on a Docker host
 ```
 
 ## Apply safety
@@ -86,7 +105,10 @@ transaction directory and validated with `nft -c -f` **before** replacing
 
 The transaction snapshots the live nft ruleset (not just the potentially stale
 config), the original config including symlinks or its absence, and the original
-service enabled/runtime-enabled and masked/runtime-masked state. With the SSH
+service enabled/runtime-enabled and masked/runtime-masked state, and whether the
+unit was active — a rollback that restores only enablement would leave the unit
+inactive while the rules are live, which is a different state from the one it
+replaced. With the SSH
 check enabled, an independent transient systemd timer restores these snapshots
 even if Ansible loses connectivity. Rescue attempts immediate restoration when
 the host remains reachable; failures are reported and transaction snapshots and
@@ -354,9 +376,11 @@ Keep `nft_ssh_check_port` consistent with the real listener as well.
 
 ## Verified behavior
 
-The destructive VM suite was run on Debian 13 (`lans@192.168.122.241`) on
-2026-10-14 with `--reboot`: **22 PASS, 0 FAIL**, original config absence,
-runtime, service state and history restored. It covers the baseline applying
+The destructive suite was run on three targets on 2026-10-14, all green: a
+Debian 13 VM with `--reboot` (**22 PASS, 0 FAIL**), and two rented public hosts
+— Debian 13 and Ubuntu 26.04 — with `--reboot --docker --bastion` pointing at
+each other (**26 PASS, 0 FAIL** each). Original config, runtime, service state,
+table inventory and history were restored on every target. It covers the baseline applying
 with the shipped spoof guards enabled on a host whose management source is
 private, both SSH rollback paths (immediate rescue and independent timer), the
 timer/commit race, the lockout reproduced with both protections disabled,
@@ -366,11 +390,15 @@ limiting, package removal under check mode, and reboot persistence. See
 [tests/README.md](tests/README.md) for the scenario table, the earlier rounds
 and what they found.
 
-Not covered: idempotence of `prepare`/`commit` under a real Ansible SSH retry
-(reviewed and exercised by hand, not automated), an actual reboot *inside* the
-transaction window (the on-boot unit's lifecycle is asserted instead), IPv6
-flood behavior, precise rate-limit refill timing, denied UDP, and every possible
-initial masked/runtime service state.
+The public hosts add what a single VM cannot: a public-WAN management source,
+a second distribution and nft version, a real `ProxyJump` path with a delegated
+probe, coexistence with a running Docker container's published port, and a
+reboot inside the transaction window over the internet.
+
+Not covered: routable IPv6 (every target had link-local only), a multi-homed or
+forwarding host, nft older than 1.1.3, IPv6 flood behavior, precise rate-limit
+refill timing, denied UDP, and every possible initial masked/runtime service
+state.
 
 ## Rule DSL
 

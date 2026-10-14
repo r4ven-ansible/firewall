@@ -75,6 +75,50 @@ guards sitting before `allow_established` drop reply traffic from a resolver or
 gateway on a private uplink. The first two were fixed in the runner, the rest in
 the role.
 
+## Integration runs on public hosts (2026-10-14)
+
+```sh
+python3 tests/run_vm.py --host <target> --user root --reboot --docker --bastion <other target>
+```
+
+Two rented hosts in one /25, each acting as the other's jump host, addresses
+redacted. Both finished at **26 PASS, 0 FAIL** with the original config,
+runtime, service state, table inventory and backup history restored.
+
+| Target | Result |
+|---|---|
+| Debian 13, nft 1.1.3, Docker 26.1.5, public /25, root login | 26 PASS, 0 FAIL |
+| Ubuntu 26.04, nft 1.1.6, Docker 29.1.3, public /25, root login | 26 PASS, 0 FAIL |
+
+What these runs add over the VM suite:
+
+- **Public WAN.** The management source is a public address, so it is classified
+  into `input_wan` instead of being an on-link LAN neighbour. The lockout
+  scenario adds that source to `@lan4` to stay reproducible on this topology.
+- **A second distribution and nft version**, including Ubuntu's systemd-resolved
+  stub resolver on loopback.
+- **A jump host.** The role applied through `ProxyJump` both with the connection
+  probe and with the TCP probe delegated to the jump host.
+- **Docker.** With a running container publishing a port: the default per-table
+  replacement leaves Docker's tables alone and the port keeps working, and
+  `nft_flush_ruleset: true` plus `nft_restart_docker: true` brings the port back
+  after a full flush. A container needs a restart policy to survive the daemon
+  restart that implies.
+- **A reboot inside the transaction window**, recovered by the persistent
+  on-boot unit, on a machine reached over the public internet.
+
+Four earlier rounds on these hosts found only harness problems, each fixed here:
+two suites started in parallel from one controller shared both the loopback
+probe ports and the upstream per-source budget; the UDP echo probe had no
+retries, which on a public path makes one lost datagram look like a closed port;
+the Docker container had no restart policy; the final comparison required
+Docker's own tables to be byte-identical after a daemon restart, where only the
+managed tables can be; and the connection-probe scenario had a 10 s budget to
+re-establish an SSH connection, which is a VM-grade assumption. The role itself
+behaved correctly in every one of those rounds: it never committed an
+unreachable host, rolled back, and left the snapshot plus an armed net with the
+cleanup command in the error.
+
 ## Earlier integration run, before the safety rework (2026-10-13)
 
 The table below is the run of the previous role version, kept for comparison. It predates the management allow rule, the independent rollback arming, the persistent on-boot restore, drift detection and the preflight asserts, and it ran with the four spoof guards neutralised by `null`. See the section after it for the current run.

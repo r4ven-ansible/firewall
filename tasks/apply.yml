@@ -147,6 +147,16 @@
                   enabled) systemctl enable nftables.service || return 1 ;;
                   enabled-runtime) systemctl enable --runtime nftables.service || return 1 ;;
               esac
+              # Before re-masking: starting a masked unit fails, and a
+              # snapshot can legitimately be masked and active at once. Also
+              # before "nft -f runtime", so ExecStop's flush and ExecStart's
+              # load of the restored config are both harmless - the snapshot is
+              # applied afterwards either way.
+              case "$(cat active 2>/dev/null || echo unknown)" in
+                  active|activating|reloading) systemctl start nftables.service || return 1 ;;
+                  unknown) ;;
+                  *) systemctl stop nftables.service 2>/dev/null || true ;;
+              esac
               case "$(cat masked)" in
                   masked) systemctl mask nftables.service || return 1 ;;
                   masked-runtime) systemctl mask --runtime nftables.service || return 1 ;;
@@ -194,6 +204,11 @@
                   *) echo "Unsupported nftables unit state: $service_state" >&2; exit 1 ;;
               esac
               printf '%s\n' "$service_state" > masked
+              # Whether the unit had loaded the rules, not just whether it was
+              # enabled: a rollback that only restores enablement leaves the
+              # unit inactive while the rules are live, which is a different
+              # state from the one it replaced.
+              systemctl is-active nftables.service > active || true
               # is-enabled reports masked even when enablement links remain.
               if find /etc/systemd/system -type l \( -path '*.wants/nftables.service' -o -path '*.requires/nftables.service' \) | grep -q .; then
                   echo enabled > enabled

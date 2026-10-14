@@ -192,12 +192,27 @@
     - (nft_apply_required | default(false) | bool) or (nft_fingerprint.stdout | default('') == 'unknown')
   tags: [firewall, nft_config, nft_apply]
 
+# Kept non-fatal so a host where Docker is not installed yet still converges,
+# but a failure is reported: with nft_flush_ruleset the container rules are gone
+# until the daemon reprograms them, and silence would hide that.
+# ignore_errors, not failed_when: false - the latter rewrites the result to
+# failed: false, so nothing downstream can tell that the restart failed.
 - name: Restart docker
   ansible.builtin.systemd_service:
     name: docker
     state: restarted
-  failed_when: false
+  ignore_errors: true
+  register: nft_docker_restart
   when:
     - nft_restart_docker | bool
     - nft_config_copied.changed | default(false)
+  tags: [firewall, nft_docker]
+
+- name: Report a failed docker restart
+  ansible.builtin.debug:
+    msg: >-
+      Restarting docker failed ({{ nft_docker_restart.msg | default('no message') }}).
+      Any rules the daemon owns, including published container ports, stay
+      missing until it is restarted successfully.
+  when: nft_docker_restart is defined and nft_docker_restart is failed
   tags: [firewall, nft_docker]

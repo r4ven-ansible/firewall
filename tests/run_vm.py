@@ -9,12 +9,15 @@ import shlex
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--host', default='192.168.122.241')
 p.add_argument('--user', default='lans')
 p.add_argument('--reboot', action='store_true')
+p.add_argument('--bastion', help='host to test ProxyJump/delegated reachability through (needs the same credentials)')
+p.add_argument('--docker', action='store_true', help='also cover coexistence with an already installed Docker')
 a = p.parse_args()
 root = Path(__file__).resolve().parents[1]
 state_dir = '/var/lib/nftables-firewall'
@@ -23,14 +26,16 @@ remote = '/root/' + logs.name
 unit = logs.name
 results = []
 seq = 0
+seq_lock = threading.Lock()
 base_ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=3', '-o', 'ServerAliveCountMax=2']
 master = ['-o', 'ControlMaster=auto', '-o', 'ControlPersist=600', '-o', f'ControlPath={logs}/ssh']
 env = dict(os.environ, ANSIBLE_CONFIG=str(logs / 'ansible.cfg'), ANSIBLE_ROLES_PATH=str(root.parent), ANSIBLE_NOCOLOR='1', ANSIBLE_HOST_KEY_CHECKING='True')
 
 def run(cmd, timeout=180, check=True, stdin=None):
     global seq
-    seq += 1
-    name = logs / f'{seq:03}.log'
+    with seq_lock:
+        seq += 1
+        name = logs / f'{seq:03}.log'
     try:
         r = subprocess.run(cmd, input=stdin, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, env=env, cwd=logs)
     except subprocess.TimeoutExpired as e:
@@ -41,8 +46,20 @@ def run(cmd, timeout=180, check=True, stdin=None):
         raise RuntimeError(f'rc={r.returncode}; {name}: {r.stdout[-1800:]}')
     return r
 
+privileged = 'sh -s' if a.user == 'root' else 'sudo -n sh -s'
+
+
 def ssh(script, **kw):
-    return run(base_ssh + master + [f'{a.user}@{a.host}', 'sudo -n sh -s'], stdin=script, **kw)
+    return run(base_ssh + master + [f'{a.user}@{a.host}', privileged], stdin=script, **kw)
+
+def reserve_port():
+    # Bound but not listening: a probe gets refused until the scenario calls
+    # listen(), and the number cannot clash with another run on this host.
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('127.0.0.1', 0))
+    return sock, sock.getsockname()[1]
+
 
 def ssh_fresh():
     return run(base_ssh + ['-o', 'ControlPath=none', f'{a.user}@{a.host}', 'true'], check=False, timeout=40)
@@ -84,12 +101,15 @@ base['nft_rules_extra'] = dict(wan_ssh_flood_ipv4=None, wan_ssh_flood_ipv6=None)
 wan_view = {'nft_lan4_networks': ['10.0.0.0/8', '172.16.0.0/12']}
 # Both the management allow rule and the on-link spoof exceptions independently
 # prevent the lockout this role was fixed for; reproducing it needs both off.
-# Keeps the baseline LAN classification (the controller is inside 192.168.0.0/16)
-# so the guard matches it, with the on-link exception and the management rule off.
-unprotected = {'nft_mgmt_allow_enabled': False, 'nft_wan_local4_networks': []}
+# The guard only bites a source the baseline calls private, so the controller's
+# real source address is added to @lan4 for that scenario: on a public-WAN host
+# it is not inside 192.168.0.0/16 and nothing would be dropped otherwise.
+mgmt_source = run(base_ssh + master + [f'{a.user}@{a.host}', 'printf %s "${SSH_CLIENT%% *}"']).stdout.strip()
+unprotected = {'nft_mgmt_allow_enabled': False, 'nft_wan_local4_networks': [],
+               'nft_lan4_networks': ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', f'{mgmt_source}/32']}
 (logs / 'inventory').write_text(f'vm ansible_host={a.host} ansible_user={a.user} ansible_python_interpreter=/usr/bin/python3\n')
 (logs / 'ansible.cfg').write_text('[defaults]\nretry_files_enabled=False\n[ssh_connection]\nssh_args=' + shlex.join(base_ssh[1:] + master) + '\n')
-(logs / 'play.yml').write_text(json.dumps([dict(hosts='vm', become=True, gather_facts=True, vars_files=[str(root / 'examples/inventory/group_vars/all/firewall.yml')], roles=[str(root)])]))
+(logs / 'play.yml').write_text(json.dumps([dict(hosts='vm', become=a.user != 'root', gather_facts=True, vars_files=[str(root / 'examples/inventory/group_vars/all/firewall.yml')], roles=[str(root)])]))
 
 def play(extra=None, flags=(), expected=0, timeout=140):
     v = dict(base)
@@ -102,19 +122,27 @@ def play(extra=None, flags=(), expected=0, timeout=140):
     return r
 
 def state():
-    return ssh("sha256sum /etc/nftables.conf; systemctl is-enabled nftables; systemctl is-active nftables; /usr/sbin/nft -s list ruleset; find /root/nft_backup -type f -printf '%f %s %T@\\n' 2>/dev/null | sort", check=False).stdout
+    return ssh("sha256sum /etc/nftables.conf; systemctl is-enabled nftables; systemctl is-active nftables; /root/fw-ruleset; find /root/nft_backup -type f -printf '%f %s %T@\\n' 2>/dev/null | sort", check=False).stdout
 
-def probe(port, udp=False):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM if udp else socket.SOCK_STREAM) as s:
-        s.settimeout(1)
-        try:
-            if udp:
-                s.sendto(b'test', (a.host, port))
-                return s.recv(100) == b'test'
-            s.connect((a.host, port))
-            return True
-        except OSError:
-            return False
+def probe(port, udp=False, attempts=1):
+    # UDP has no retransmission, and a public target makes a single lost
+    # datagram look like a closed port.
+    for attempt in range(attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM if udp else socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            try:
+                if udp:
+                    s.sendto(b'test', (a.host, port))
+                    if s.recv(100) == b'test':
+                        return True
+                else:
+                    s.connect((a.host, port))
+                    return True
+            except OSError:
+                pass
+        if attempt + 1 < attempts:
+            time.sleep(1)
+    return False
 
 def disarm_all():
     # Failure paths leave the armed net and snapshots for investigation; a stale
@@ -131,7 +159,7 @@ def wait_restored(before, seconds=100):
     # systemd-run timers coalesce, so OnActiveSec is not a deadline.
     deadline = time.monotonic() + seconds
     while True:
-        now = ssh('sha256sum /etc/nftables.conf; /usr/sbin/nft -s list ruleset; systemctl is-enabled nftables; systemctl is-active nftables', check=False, timeout=15)
+        now = ssh('sha256sum /etc/nftables.conf; /root/fw-ruleset; systemctl is-enabled nftables; systemctl is-active nftables', check=False, timeout=15)
         if (now.returncode == 0 and now.stdout == before) or time.monotonic() >= deadline:
             return now
         time.sleep(3)
@@ -155,14 +183,30 @@ case "$(cat mask)" in masked) systemctl mask nftables;; masked-runtime) systemct
 touch restored
 '''
 print(f'Logs: {logs}; emergency snapshot: {remote}', flush=True)
+# Dynamic set contents move on their own: the suite's own SSH connections feed
+# the controller's address into the flood set, which would make every state
+# comparison unstable. Comparisons go through a dump with those blocks removed.
 ssh(f'''set -eu
 umask 077
 mkdir {remote}
 cd {remote}
 test -x /usr/sbin/nft
+cat > /root/fw-ruleset <<'FILTER'
+#!/bin/sh
+/usr/sbin/nft -s list ruleset | sed '/^\\tset ssh_flood[46] {{$/,/^\\t}}$/d'
+FILTER
+cat > /root/fw-managed <<'MANAGED'
+#!/bin/sh
+for table in "inet filter" "inet nat"; do
+    /usr/sbin/nft -s list table $table 2>/dev/null | sed '/^\\tset ssh_flood[46] {{$/,/^\\t}}$/d'
+done
+MANAGED
+chmod 700 /root/fw-ruleset /root/fw-managed
 printf 'flush ruleset\\n' > runtime
 /usr/sbin/nft list ruleset >> runtime
-/usr/sbin/nft -s list ruleset > runtime-static
+/root/fw-ruleset > runtime-static
+/root/fw-managed > managed-static
+/usr/sbin/nft list tables | sort > tables-static
 if test -e /etc/nftables.conf || test -L /etc/nftables.conf; then cp -a /etc/nftables.conf config; touch config-present; fi
 if test -e /root/nft_backup; then cp -a /root/nft_backup history; touch history-present; fi
 systemctl is-active nftables > active || true
@@ -210,9 +254,9 @@ try:
     record('syntax failure', syntax)
     # This scenario preserves established management but rejects new SSH.
     def newssh():
-        before = ssh('sha256sum /etc/nftables.conf; /usr/sbin/nft -s list ruleset; systemctl is-enabled nftables').stdout
+        before = ssh('sha256sum /etc/nftables.conf; /root/fw-ruleset; systemctl is-enabled nftables').stdout
         play(dict(wan_view, nft_rules_extra=dict(base['nft_rules_extra'], wan_allow_ssh=None), nft_rollback_timeout=60, nft_mgmt_allow_enabled=False), expected=1)
-        after = ssh('sha256sum /etc/nftables.conf; /usr/sbin/nft -s list ruleset; systemctl is-enabled nftables').stdout
+        after = ssh('sha256sum /etc/nftables.conf; /root/fw-ruleset; systemctl is-enabled nftables').stdout
         require(before == after, 'immediate rollback did not restore config/runtime/service')
         require(ssh(f"grep -l rolled-back {state_dir}/nft-transaction-*/state").stdout.strip(), 'no rolled-back transaction')
         # The failure path leaves the armed net for investigation; the suite
@@ -222,14 +266,14 @@ try:
     record('new SSH immediate rollback', newssh)
     def blocked():
         arm()
-        before = ssh('sha256sum /etc/nftables.conf; /usr/sbin/nft -s list ruleset; systemctl is-enabled nftables; systemctl is-active nftables').stdout
+        before = ssh('sha256sum /etc/nftables.conf; /root/fw-ruleset; systemctl is-enabled nftables; systemctl is-active nftables').stdout
         # Drop at input order 1, before established; timeout exceeds rollback to exercise false success race.
         drop = dict(order=1, family='inet', table='filter', chain='input', match={'tcp': {'dport': 22}}, action='drop', comment='TEST full SSH block')
         play({'nft_rules_extra': dict(base['nft_rules_extra'], full_block=drop), 'nft_ssh_check_timeout': 40, 'nft_rollback_timeout': 15, 'nft_timeout_assert_enabled': False, 'nft_mgmt_allow_enabled': False}, expected=1, timeout=110)
         # systemd-run timers have default coalescing, so OnActiveSec is not a deadline.
         deadline = time.monotonic() + 100
         while True:
-            restored = ssh('sha256sum /etc/nftables.conf; /usr/sbin/nft -s list ruleset; systemctl is-enabled nftables; systemctl is-active nftables', check=False, timeout=15)
+            restored = ssh('sha256sum /etc/nftables.conf; /root/fw-ruleset; systemctl is-enabled nftables; systemctl is-active nftables', check=False, timeout=15)
             if restored.returncode == 0 or time.monotonic() >= deadline:
                 break
             time.sleep(3)
@@ -241,14 +285,13 @@ try:
     record('full SSH block / timer / nonzero rc / enabled unmasked', blocked)
     def timer_race():
         arm()
-        before = ssh('sha256sum /etc/nftables.conf; /usr/sbin/nft -s list ruleset; systemctl is-enabled nftables; systemctl is-active nftables').stdout
-        import threading
+        before = ssh('sha256sum /etc/nftables.conf; /root/fw-ruleset; systemctl is-enabled nftables; systemctl is-active nftables').stdout
         ready = threading.Event()
+        held, race_port = reserve_port()
+
         def delayed_listener():
             time.sleep(110)
-            with socket.socket() as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(('127.0.0.1', 18199))
+            with held as s:
                 s.listen()
                 s.settimeout(35)
                 ready.set()
@@ -261,14 +304,14 @@ try:
         thread.start()
         # With AccuracySec=1s the timer is punctual, so the timeout has to be
         # long enough for apply to win and short enough to beat the probe.
-        r = play({'nft_allowed_ports': ['18100'], 'nft_rollback_timeout': 25, 'nft_ssh_check_timeout': 140, 'nft_ssh_check_tcp': True, 'nft_ssh_check_connection': False, 'nft_ssh_check_host': '127.0.0.1', 'nft_ssh_check_port': 18199, 'nft_timeout_assert_enabled': False}, expected=1, timeout=200)
+        r = play({'nft_allowed_ports': ['18100'], 'nft_rollback_timeout': 25, 'nft_ssh_check_timeout': 140, 'nft_ssh_check_tcp': True, 'nft_ssh_check_connection': False, 'nft_ssh_check_host': '127.0.0.1', 'nft_ssh_check_port': race_port, 'nft_timeout_assert_enabled': False}, expected=1, timeout=200)
         thread.join(timeout=35)
         require(ready.is_set(), 'delayed probe listener unavailable')
         # The generated playbook references the role by path, so the task name
         # carries that prefix; match on the suffix only.
         commit_output = r.stdout.split(': Commit only if rollback has not started]')[-1].split('TASK [')[0]
         require('fatal:' in commit_output and 'non-zero return code' in commit_output, 'did not exercise post-timer commit failure')
-        require(before == ssh('sha256sum /etc/nftables.conf; /usr/sbin/nft -s list ruleset; systemctl is-enabled nftables; systemctl is-active nftables').stdout, 'timer race restoration mismatch')
+        require(before == ssh('sha256sum /etc/nftables.conf; /root/fw-ruleset; systemctl is-enabled nftables; systemctl is-active nftables').stdout, 'timer race restoration mismatch')
         disarm_all()
     record('timer wins despite successful SSH / no false success', timer_race)
     arm()
@@ -296,7 +339,13 @@ while True:
 '''
         ssh(f"cat > {remote}/listen.py <<'PY'\n{listener}\nPY\nsystemd-run --unit={unit}-listener /usr/bin/python3 {remote}/listen.py")
         time.sleep(2)
-        require(probe(18080) and probe(18082) and probe(18081, True) and not probe(18083), 'WAN positive/negative TCP/UDP probe failed')
+        results = {
+            'tcp 18080 (nft_allowed_ports)': probe(18080, attempts=3),
+            'tcp 18082 (nft_rules_host)': probe(18082, attempts=3),
+            'udp 18081 echo': probe(18081, udp=True, attempts=5),
+            'tcp 18083 must be denied': not probe(18083),
+        }
+        require(all(results.values()), 'WAN probes: ' + ', '.join(f'{name}={ok}' for name, ok in results.items()))
     record('WAN TCP/UDP live probes', wan)
     def history():
         for ports in (['18084'], ['18085'], ['18086'], ['18087']):
@@ -319,7 +368,7 @@ while True:
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
             hits = list(pool.map(lambda _: probe(22), range(40)))
         require(any(hits) and not all(hits), f'no measurable limit: {sum(hits)}/40')
-        require('192.168.' in ssh('/usr/sbin/nft list set inet filter ssh_flood4').stdout, 'source missing in dynamic set')
+        require(mgmt_source in ssh('/usr/sbin/nft list set inet filter ssh_flood4').stdout, 'source missing in dynamic set')
         # Clear the per-source budget, then drain the sshd penalty the admitted
         # (unauthenticated) probes earned, before the next scenario needs a new
         # connection.
@@ -353,7 +402,7 @@ while True:
     # protection is what makes the baseline safe.
     def lockout_regression():
         arm()
-        before = ssh('sha256sum /etc/nftables.conf; /usr/sbin/nft -s list ruleset; systemctl is-enabled nftables; systemctl is-active nftables').stdout
+        before = ssh('sha256sum /etc/nftables.conf; /root/fw-ruleset; systemctl is-enabled nftables; systemctl is-active nftables').stdout
         play(dict(unprotected, nft_rollback_timeout=15, nft_allowed_ports=['18103']), expected=1, timeout=150)
         require(wait_restored(before).stdout == before, 'unprotected baseline lockout was not restored')
         # Established sessions survive the guards, so the rescue path may win
@@ -366,7 +415,7 @@ while True:
     # used to disarm the timer and leave an unreachable host unrecoverable.
     def rollback_without_checks():
         arm()
-        before = ssh('sha256sum /etc/nftables.conf; /usr/sbin/nft -s list ruleset; systemctl is-enabled nftables; systemctl is-active nftables').stdout
+        before = ssh('sha256sum /etc/nftables.conf; /root/fw-ruleset; systemctl is-enabled nftables; systemctl is-active nftables').stdout
         drop = dict(order=1, family='inet', table='filter', chain='input', match={'tcp': {'dport': 22}}, action='drop', comment='TEST block with checks disabled')
         play({'nft_rules_extra': dict(base['nft_rules_extra'], full_block=drop), 'nft_mgmt_allow_enabled': False, 'nft_ssh_check_enabled': False, 'nft_rollback_timeout': 15, 'nft_timeout_assert_enabled': False}, expected=1, timeout=150)
         require(wait_restored(before).stdout == before, 'timer did not restore with checks disabled')
@@ -380,7 +429,7 @@ while True:
         ssh('/usr/sbin/nft flush ruleset')
         r = play({'nft_allowed_ports': ['18104']}, flags=('-t', 'nft_apply'))
         require('changed=0' not in r.stdout, 'runtime drift did not trigger a reapply')
-        require('18104' in ssh('/usr/sbin/nft -s list ruleset').stdout, 'ruleset not restored after drift')
+        require('18104' in ssh('/root/fw-ruleset').stdout, 'ruleset not restored after drift')
         idem({'nft_allowed_ports': ['18104']})
     record('runtime drift is detected and reapplied', drift_reapply)
 
@@ -393,19 +442,179 @@ while True:
         require(state() == before, 'preflight assert mutated state')
     record('ssh_port mismatch refused before apply', port_mismatch)
 
+    # Ansible re-runs a task after an SSH blip. Invoking the installed script a
+    # second time is exactly what that retry does: prepare must not re-snapshot
+    # the already applied rules (it would record them as the original state) and
+    # commit must not fail on a transaction it already committed. The play is
+    # held between apply and commit by a probe whose listener appears later, so
+    # the duplicate invocations land inside the real window.
+    def retry_idempotence():
+        ready = threading.Event()
+        held, retry_port = reserve_port()
+
+        def delayed_listener():
+            time.sleep(70)
+            with held as sock:
+                sock.listen()
+                sock.settimeout(120)
+                ready.set()
+                try:
+                    conn, _ = sock.accept()
+                    conn.close()
+                except OSError:
+                    pass
+
+        listener = threading.Thread(target=delayed_listener, daemon=True)
+        listener.start()
+        outcome = {}
+
+        def runner():
+            try:
+                outcome['result'] = play({'nft_allowed_ports': ['18112'], 'nft_ssh_check_host': '127.0.0.1',
+                                          'nft_ssh_check_port': retry_port, 'nft_ssh_check_timeout': 180,
+                                          'nft_rollback_timeout': 600, 'nft_ssh_check_connection': False},
+                                         timeout=300)
+            except BaseException as error:  # reported in the main thread
+                outcome['error'] = error
+
+        play_thread = threading.Thread(target=runner, daemon=True)
+        play_thread.start()
+        armed = ''
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            probe = ssh(f"ls -d {state_dir}/nft-transaction-*/armed 2>/dev/null | head -1; grep -c 18112 /etc/nftables.conf 2>/dev/null || echo 0", check=False).stdout.split()
+            if len(probe) == 2 and probe[0].endswith('/armed') and probe[1] != '0':
+                armed = probe[0]
+                break
+            time.sleep(2)
+        require(armed, 'transaction window never opened')
+        txn = armed.rsplit('/', 1)[0]
+        snapshot = ssh(f"cd {txn}; sha256sum runtime; cat state; stat -c %Y runtime").stdout
+        ssh(f'{txn}/transaction prepare')
+        require(ssh(f"cd {txn}; sha256sum runtime; cat state; stat -c %Y runtime").stdout == snapshot,
+                'a retried prepare re-snapshotted an armed transaction')
+        ssh(f'{txn}/transaction commit')
+        require(ssh(f'cat {txn}/state').stdout.strip() == 'committed', 'commit did not mark the state')
+        ssh(f'{txn}/transaction commit')
+        require(ssh(f'cat {txn}/state').stdout.strip() == 'committed', 'a retried commit changed the state')
+        require(ready.wait(timeout=180), 'delayed probe listener unavailable')
+        play_thread.join(timeout=240)
+        require('error' not in outcome, f"play raised: {outcome.get('error')}")
+        require(outcome.get('result') is not None, 'play did not finish')
+        require('18112' in ssh('/root/fw-ruleset').stdout, 'rules missing after duplicated invocations')
+        require(not ssh(f'ls -d {txn} 2>/dev/null', check=False).stdout.strip(), 'committed transaction not removed')
+        idem({'nft_allowed_ports': ['18112']})
+    record('retried prepare and commit stay idempotent', retry_idempotence)
+
+    # The documented bastion setup: the control node reaches the target only
+    # through a jump host, so the TCP probe from here is meaningless and the
+    # README tells operators to use the connection probe or delegate the TCP one
+    # to the jump host. Both paths are exercised here for real.
+    def bastion():
+        inventory = logs / 'inventory-bastion'
+        inventory.write_text(
+            f'vm ansible_host={a.host} ansible_user={a.user} ansible_python_interpreter=/usr/bin/python3 '
+            f"ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new -o ProxyJump={a.user}@{a.bastion}'\n"
+            f'bastion ansible_host={a.bastion} ansible_user={a.user} ansible_python_interpreter=/usr/bin/python3\n')
+        play_file = logs / 'play-bastion.yml'
+        play_file.write_text(json.dumps([dict(hosts='vm', become=a.user != 'root', gather_facts=True,
+                                              vars_files=[str(root / 'examples/inventory/group_vars/all/firewall.yml')],
+                                              roles=[str(root)])]))
+
+        def through_bastion(extra, expected=0):
+            variables = dict(base)
+            variables.update(extra)
+            vars_path = logs / f'{seq + 1:03}-bastion-vars.json'
+            vars_path.write_text(json.dumps(variables))
+            r = run(['ansible-playbook', '-i', str(inventory), str(play_file), '-e', '@' + str(vars_path),
+                     '-t', 'nft_apply'], timeout=200, check=False)
+            require((r.returncode == 0) if expected == 0 else (r.returncode != 0),
+                    f'Unexpected Ansible rc={r.returncode}: {r.stdout[-2000:]}')
+            return r
+
+        # The connection probe follows ProxyJump, so it proves the real path.
+        through_bastion({'nft_allowed_ports': ['18115'], 'nft_ssh_check_connection': True,
+                         'nft_ssh_check_tcp': False, 'nft_rollback_timeout': 120})
+        require('18115' in ssh('/root/fw-ruleset').stdout, 'apply through the jump host did not land')
+        # The TCP probe delegated to the jump host, which does have direct access.
+        through_bastion({'nft_allowed_ports': ['18116'], 'nft_ssh_check_connection': False,
+                         'nft_ssh_check_tcp': True, 'nft_ssh_check_delegate': 'bastion',
+                         'nft_rollback_timeout': 120})
+        require('18116' in ssh('/root/fw-ruleset').stdout, 'delegated probe apply did not land')
+        require(not ssh(f"find {state_dir} -maxdepth 1 -type d -name 'nft-transaction-*' -printf '%p\\n' 2>/dev/null", check=False).stdout.strip(),
+                'bastion runs leaked a transaction directory')
+        positive()
+    if a.bastion:
+        record('apply through a jump host, connection probe and delegated TCP probe', bastion)
+
+    # Docker keeps its own tables; the role must not take them down, and the
+    # documented flush_ruleset + restart_docker combination must put them back.
+    def docker():
+        # Earlier scenarios apply with nft_flush_ruleset=True, which takes
+        # Docker's chains down with everything else. Restarting Docker is the
+        # documented recovery and the precondition for this scenario.
+        ssh('docker rm -f fwtest >/dev/null 2>&1 || true; systemctl restart docker', timeout=120)
+        time.sleep(5)
+        # A restart policy is required: restarting the daemon stops containers
+        # that have none, and nft_restart_docker restarts the daemon.
+        ssh('docker run -d --name fwtest --restart unless-stopped -p 18120:80 busybox httpd -f -p 80', timeout=180)
+        time.sleep(3)
+        require(probe(18120), 'published container port unreachable before the role ran')
+        tables_before = ssh("/usr/sbin/nft list tables | grep -v 'inet filter' | grep -v 'inet nat' | sort").stdout
+        require(tables_before.strip(), 'Docker created no tables of its own')
+        # Default: per-table replacement leaves foreign tables alone.
+        positive({'nft_flush_ruleset': False, 'nft_allowed_ports': ['18121']})
+        require(ssh("/usr/sbin/nft list tables | grep -v 'inet filter' | grep -v 'inet nat' | sort").stdout == tables_before,
+                "the role's apply removed Docker's tables")
+        require(probe(18120), 'published container port unreachable after a non-flushing apply')
+        # flush_ruleset wipes every table, including Docker's; the documented
+        # answer is nft_restart_docker, which must bring them back.
+        play({'nft_flush_ruleset': True, 'nft_restart_docker': True, 'nft_allowed_ports': ['18122']}, timeout=200)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not probe(18120):
+            time.sleep(3)
+        require(probe(18120), f"nft_restart_docker did not restore the published port after a full flush; container: {ssh('docker inspect fwtest --format Running={{.State.Running}}', check=False).stdout.strip()}")
+        require(ssh("/usr/sbin/nft list tables | grep -v 'inet filter' | grep -v 'inet nat' | sort").stdout.strip(),
+                "Docker's tables are missing after the restart")
+        # Foreign tables must not look like drift on the next run.
+        idem({'nft_flush_ruleset': True, 'nft_restart_docker': True, 'nft_allowed_ports': ['18122']})
+        # Back to no published ports, so the final restoration check compares
+        # like with like.
+        ssh('docker rm -f fwtest >/dev/null 2>&1 || true; systemctl restart docker', timeout=120)
+        time.sleep(5)
+        positive()
+    if a.docker:
+        record('coexistence with Docker tables and published ports', docker)
+
     # A reachability timeout that outlives the rollback timer would roll back a
     # healthy host mid-check; the guard refuses it before anything changes.
     # The reset-and-reconnect probe is off by default; this is the only scenario
     # that exercises it, including that it does not break a healthy apply.
     def connection_probe():
-        positive({'nft_allowed_ports': ['18105'], 'nft_ssh_check_connection': True, 'nft_ssh_check_tcp': False})
-        require('18105' in ssh('/usr/sbin/nft -s list ruleset').stdout, 'connection probe path did not apply')
+        # This scenario deliberately drops the persistent connection and
+        # reconnects, so it needs a source that sshd is not currently
+        # penalising and a timeout that fits a public network.
+        require(wait_ssh(), 'sshd still refuses new connections before the connection probe')
+        try:
+            positive({'nft_allowed_ports': ['18105'], 'nft_ssh_check_connection': True,
+                      'nft_ssh_check_tcp': False, 'nft_ssh_check_timeout': 30,
+                      'nft_rollback_timeout': 120})
+        except Exception:
+            # Evidence for why a fresh connection did not come up: the live
+            # policy for port 22 and what sshd thought of us.
+            evidence = ssh("/root/fw-ruleset | grep -nE 'dport 22|ssh_flood|management path' ; journalctl -u ssh -u sshd --since '-2 minutes' --no-pager | tail -15", check=False).stdout
+            raise AssertionError(f'connection probe failed; port 22 policy and sshd log:\n{evidence}')
+        require('18105' in ssh('/root/fw-ruleset').stdout, 'connection probe path did not apply')
+        disarm_all()
     record('reachability probe over the Ansible connection path', connection_probe)
 
     # An armed neighbour transaction must stop a new one: its timer would undo
     # the new commit, and its snapshot would be the wrong original state. A
     # finished neighbour must instead be collected silently.
     def overlapping_transactions():
+        # A leftover armed transaction from an earlier failure would be refused
+        # for the right reason and hide what this scenario actually tests.
+        disarm_all()
         before = state()
         ssh(f"set -eu; mkdir -p {state_dir}/nft-transaction-fake; printf 'rollback-failed\\n' > {state_dir}/nft-transaction-fake/state")
         try:
@@ -435,6 +644,71 @@ while True:
         require(not leftover, f'transaction directories left behind: {leftover}')
     record('rollback timer/service cleanup before reboot', timers_clean)
     if a.reboot:
+        # A reboot between apply and commit is the one case transient timers
+        # cannot cover: they do not survive it, the service is still masked and
+        # no rules are loaded. Only the persistent on-boot unit recovers that.
+        def reboot_in_window():
+            # Captured with the exact command wait_restored compares against.
+            before = ssh('sha256sum /etc/nftables.conf; /root/fw-ruleset; systemctl is-enabled nftables; systemctl is-active nftables', check=False).stdout
+            boot_id = ssh('cat /proc/sys/kernel/random/boot_id').stdout.strip()
+            held, dead_port = reserve_port()
+            outcome = {}
+
+            def runner():
+                try:
+                    # No listener on the probe port, so the play waits between
+                    # apply and commit while the host reboots underneath it.
+                    outcome['result'] = play({'nft_allowed_ports': ['18114'], 'nft_ssh_check_host': '127.0.0.1',
+                                              'nft_ssh_check_port': dead_port, 'nft_ssh_check_timeout': 120,
+                                              'nft_rollback_timeout': 600, 'nft_rollback_on_boot_delay': 45,
+                                              'nft_ssh_check_connection': False},
+                                             expected=1, timeout=300)
+                except BaseException as error:
+                    outcome['error'] = error
+
+            play_thread = threading.Thread(target=runner, daemon=True)
+            play_thread.start()
+            armed = ''
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                probe = ssh(f"ls -d {state_dir}/nft-transaction-*/armed 2>/dev/null | head -1; grep -c 18114 /etc/nftables.conf 2>/dev/null || echo 0", check=False).stdout.split()
+                if len(probe) == 2 and probe[0].endswith('/armed') and probe[1] != '0':
+                    armed = probe[0]
+                    break
+                time.sleep(2)
+            require(armed, 'transaction window never opened')
+            txn = armed.rsplit('/', 1)[0]
+            units = ssh("systemctl list-unit-files --plain --no-legend 'nft-rollback-*-boot.timer'").stdout
+            require('enabled' in units, f'no enabled on-boot rollback unit while armed: {units}')
+            require('masked' in ssh('systemctl is-enabled nftables', check=False).stdout, 'service not masked inside the window')
+            ssh('systemctl reboot', check=False, timeout=30)
+            play_thread.join(timeout=300)
+            time.sleep(20)
+            # Catch the exposed window first: rules gone, service still masked.
+            deadline = time.monotonic() + 120
+            exposed = ''
+            while time.monotonic() < deadline:
+                probe = ssh('cat /proc/sys/kernel/random/boot_id; systemctl is-enabled nftables; /usr/sbin/nft list table inet filter >/dev/null 2>&1 && echo loaded || echo empty', check=False, timeout=20)
+                if probe.returncode == 0 and boot_id not in probe.stdout:
+                    exposed = probe.stdout
+                    break
+                time.sleep(3)
+            require(exposed, 'host did not come back after the in-window reboot')
+            # Then the on-boot unit must restore the pre-transaction state.
+            restored = wait_restored(before, seconds=180)
+            require(restored.stdout == before, f'on-boot rollback did not restore the snapshot: {restored.stdout}')
+            require('rolled-back' in ssh(f'cat {txn}/state', check=False).stdout, 'on-boot rollback did not mark the state')
+            # The unit removes itself after a successful restore, so journalctl
+            # can no longer resolve it by name; grep the boot journal instead.
+            evidence = ssh("journalctl -b --no-pager | grep -F 'nft-rollback' | tail -5", check=False).stdout
+            require('nft-rollback' in evidence, f'no on-boot rollback evidence in the journal: {evidence}')
+            require(not ssh("systemctl list-unit-files --plain --no-legend 'nft-rollback-*-boot.timer'", check=False).stdout.strip(),
+                    'on-boot unit did not remove itself after a successful restore')
+            held.close()
+            disarm_all()
+            arm()
+        record('reboot inside the transaction window is recovered on boot', reboot_in_window)
+
         def reboot():
             positive({'nft_allowed_ports': ['18101']})
             before = ssh('cat /proc/sys/kernel/random/boot_id; sha256sum /etc/nftables.conf').stdout.splitlines()
@@ -456,7 +730,7 @@ finally:
         ssh(f'{remote}/restore', timeout=180)
         # A host without a pre-existing /etc/nftables.conf must end up without
         # one, and the role's state directory is part of what has to be gone.
-        ssh(f"set -eu; systemctl stop {unit}.timer {unit}.service {unit}-listener.service {unit}-boot.timer || true; systemctl disable {unit}-boot.timer || true; rm -f /etc/systemd/system/{unit}-boot.timer /etc/systemd/system/{unit}-boot.service; rm -rf {state_dir}; systemctl daemon-reload; cd {remote}; if test -e config-present; then cmp config /etc/nftables.conf; else test ! -e /etc/nftables.conf; fi; /usr/sbin/nft -s list ruleset > final-runtime; cmp runtime-static final-runtime; test \"$(systemctl is-enabled nftables)\" = \"$(cat mask)\"; test \"$(systemctl is-active nftables)\" = \"$(cat active)\"; if test -e history-present; then diff -r history /root/nft_backup; else test ! -e /root/nft_backup; fi", timeout=60)
+        ssh(f"set -eu; systemctl stop {unit}.timer {unit}.service {unit}-listener.service {unit}-boot.timer || true; systemctl disable {unit}-boot.timer || true; rm -f /etc/systemd/system/{unit}-boot.timer /etc/systemd/system/{unit}-boot.service; rm -rf {state_dir}; systemctl daemon-reload; cd {remote}; if test -e config-present; then cmp config /etc/nftables.conf; else test ! -e /etc/nftables.conf; fi; /root/fw-managed > final-managed; cmp managed-static final-managed; /usr/sbin/nft list tables | sort > final-tables; cmp tables-static final-tables; test \"$(systemctl is-enabled nftables)\" = \"$(cat mask)\"; test \"$(systemctl is-active nftables)\" = \"$(cat active)\"; if test -e history-present; then diff -r history /root/nft_backup; else test ! -e /root/nft_backup; fi; rm -f /root/fw-ruleset /root/fw-managed", timeout=60)
     record('restore original config/runtime/service/history', cleanup)
 print(f'Results: {logs}/results.json', flush=True)
 raise SystemExit(int(any(r['status'] == 'FAIL' for r in results)))

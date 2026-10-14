@@ -3,6 +3,7 @@
 firewall_supported_distributions:
   - Debian
   - LMDE
+  - Ubuntu
 
 firewall_enabled: false
 

@@ -9,3 +9,4 @@ dist/
 .env
 .pass
 .vault-pass*
+.serena/
